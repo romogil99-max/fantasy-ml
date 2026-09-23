@@ -1,22 +1,26 @@
-# Esquema de validación compartido por los notebooks 03 (baseline) y 04 (modelo).
-# Walk-forward por temporada: se entrena solo con temporadas anteriores a la que se valida.
-# Solo temporada regular (season_type == REG).
+# Esquema de validación compartido por los notebooks 03 (backtest) y 04 (predicciones).
+#
+# Walk-forward SEMANAL con ventana creciente: para cada semana evaluada se entrena con todos
+# los partidos anteriores (desde 2023) y se predice esa semana. Solo temporada regular.
 
-folds:
-  - name: fold_2024
-    train: [2023]
-    valid: 2024
-  - name: fold_2025
-    train: [2023, 2024]
-    valid: 2025
+scheme: weekly_walk_forward
+train_start: 2023
 
-# 2026: temporada en curso. La liga se creó en 2026, así que es la única temporada
-# con proyecciones de ESPN; se usa como holdout para comparar el modelo contra ESPN.
-# El modelo final se entrena con 2023-2025.
-holdout:
-  season: 2026
-  train: [2023, 2024, 2025]
-  compare_against: espn_projections
+# Hiperparámetros: búsqueda pequeña evaluada SOLO con el walk-forward de 2024 y congelada
+# después (config/model.yaml). 2026 tiene muy pocas semanas para ajustar nada con ella.
+tuning_season: 2024
 
-# Baseline para 2023-2025 (sin proyecciones de ESPN): media móvil de puntos del jugador.
-baseline: rolling_mean
+evaluation:
+  - season: 2024
+    role: tuning          # usada para elegir hiperparámetros: su error es optimista
+    compare_against: [baseline]
+  - season: 2025
+    role: out_of_sample
+    compare_against: [baseline]
+  - season: 2026
+    role: out_of_sample   # la liga se creó en 2026: única temporada con proyecciones de ESPN
+    compare_against: [baseline, espn_projections]
+
+# Baseline: media de los últimos 5 partidos del jugador (si no hay: temporada actual, anterior,
+# o media de la posición).
+baseline: rolling_mean_l5
