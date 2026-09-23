@@ -1,4 +1,5 @@
 """Rutas del proyecto, configuración y descarga de datos de nflverse con caché local."""
+import os
 from pathlib import Path
 
 import nflreadpy as nfl
@@ -8,7 +9,8 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 DATA_RAW = ROOT / "data" / "raw"
 DATA_PROC = ROOT / "data" / "processed"
-PREDICTIONS_LOG = ROOT / "data" / "predictions_log"
+# FANTASY_ML_PREDICTIONS_LOG permite escribir el registro en otra carpeta (pruebas con DRY_RUN=1)
+PREDICTIONS_LOG = Path(os.environ.get("FANTASY_ML_PREDICTIONS_LOG", ROOT / "data" / "predictions_log"))
 CONFIG = ROOT / "config"
 
 SEASONS = [2023, 2024, 2025, 2026]

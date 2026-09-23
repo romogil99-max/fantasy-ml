@@ -1,0 +1,10 @@
+[Unit]
+Description=fantasy-ml: predicciones semanales y commit del registro
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/fantasy-ml
+Environment=FANTASY_ML_VENV=%h/venv
+ExecStart=%h/fantasy-ml/scripts/run_weekly_predictions.sh
+TimeoutStartSec=45min
+Nice=5

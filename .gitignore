@@ -15,3 +15,6 @@ __pycache__/
 .ipynb_checkpoints/
 venv/
 .venv/
+
+# Logs de las ejecuciones automáticas (copias ejecutadas del notebook 04 incluidas)
+logs/

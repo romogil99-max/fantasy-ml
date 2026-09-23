@@ -1,0 +1,12 @@
+[Unit]
+Description=fantasy-ml: predicciones cada miércoles 22:00 y domingo 9:00 (hora de Guadalajara)
+
+[Timer]
+OnCalendar=Wed *-*-* 22:00:00 America/Mexico_City
+OnCalendar=Sun *-*-* 09:00:00 America/Mexico_City
+# Si el equipo estaba apagado a la hora programada, se ejecuta al encender. Es seguro:
+# el registro ignora los partidos que ya empezaron.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
