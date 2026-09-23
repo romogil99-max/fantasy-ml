@@ -14,7 +14,7 @@ import altair as alt
 import polars as pl
 import streamlit as st
 
-from fantasy_ml import espn, lineup as L, matchup as MU, predictions_log as plog, report, trades as T
+from fantasy_ml import espn, lineup as L, matchup as MU, outlook as O, predictions_log as plog, report, trades as T
 from fantasy_ml.data import DATA_PROC, PREDICTIONS_LOG
 
 GDL = ZoneInfo("America/Mexico_City")
@@ -49,6 +49,11 @@ def load_evaluation():
     return report.logged_vs_actual(SEASON)
 
 
+@st.cache_resource(ttl=3600, show_spinner="Proyectando las próximas semanas (~20 s)…")
+def load_outlook(horizon: int):
+    return O.analyze(T.build_trade_context(SEASON), horizon=horizon)
+
+
 def read_winprob_log() -> pl.DataFrame:
     path = PREDICTIONS_LOG / f"winprob_{SEASON}.csv"
     return pl.read_csv(path, schema_overrides=MU.WINPROB_SCHEMA) if path.exists() else pl.DataFrame(schema=MU.WINPROB_SCHEMA)
@@ -78,8 +83,8 @@ week, rival = res["week"], res["info"]["rival"]
 a, o = res["actual"], res["optimal"]
 players = res["players"]
 
-tab_week, tab_lineup, tab_fa, tab_trades, tab_model = st.tabs(
-    ["📊 Esta semana", "📋 Mi alineación", "🆓 Agentes libres", "🔁 Trades", "🎯 ¿Qué tan bien va el modelo?"])
+tab_week, tab_lineup, tab_fa, tab_next, tab_trades, tab_model = st.tabs(
+    ["📊 Esta semana", "📋 Mi alineación", "🆓 Agentes libres", "📅 Próximas semanas", "🔁 Trades", "🎯 ¿Qué tan bien va el modelo?"])
 
 # ---------------------------------------------------------------- esta semana
 
@@ -198,6 +203,79 @@ with tab_fa:
                  hide_index=True, width="stretch",
                  column_config={c: st.column_config.NumberColumn(format="%.1f") for c in ("prediccion", "p10", "p90", "espn")}
                  | {"mejora": st.column_config.NumberColumn("Mejora de la alineación", format="%+.1f")})
+
+# ---------------------------------------------------------------- próximas semanas
+
+with tab_next:
+    st.header("Próximas semanas")
+    horizon = st.segmented_control("Horizonte", options=[2, 4, 6], default=4, format_func=lambda n: f"{n} semanas")
+    out = load_outlook(horizon or 4)
+    st.caption("Tu roster actual semana a semana: los agentes libres **solo cubren los huecos** (bye o lesión sin nadie "
+               "disponible en tu roster). Proyección con features actuales y líneas de apuestas estimadas para semanas futuras.")
+
+    left, right = st.columns(2)
+    with left:
+        st.subheader("Mis puntos por semana")
+        wk = out["weekly"].with_columns(pl.col("esperado", "p10", "p90").round(1))
+        base = alt.Chart(wk.to_pandas()).encode(x=alt.X("week:O", title="Semana", axis=alt.Axis(labelAngle=0)))
+        tip = [alt.Tooltip("week:O", title="Semana"), alt.Tooltip("esperado:Q", title="Esperado", format=".1f"),
+               alt.Tooltip("p10:Q", title="P10", format=".1f"), alt.Tooltip("p90:Q", title="P90", format=".1f")]
+        chart = (base.mark_rule(color=C_MODEL, strokeWidth=4, opacity=0.35, strokeCap="round")
+                     .encode(y=alt.Y("p10:Q", title="Puntos", scale=alt.Scale(zero=False)), y2="p90:Q", tooltip=tip)
+                 + base.mark_point(color=C_MODEL, filled=True, size=90).encode(y="esperado:Q", tooltip=tip)
+                 ).properties(height=260)
+        st.altair_chart(chart, width="stretch", theme="streamlit")
+        st.caption("Punto: puntos esperados · barra: rango del 80% (Monte Carlo).")
+        st.dataframe(wk, hide_index=True, width="stretch",
+                     column_config={"week": "Semana", "esperado": st.column_config.NumberColumn("Esperado", format="%.1f"),
+                                    "p10": st.column_config.NumberColumn("P10", format="%.1f"),
+                                    "p90": st.column_config.NumberColumn("P90", format="%.1f")})
+    with right:
+        st.subheader("Probabilidad de ganar contra mis próximos rivales")
+        mt = out["matchups"]
+        if mt.is_empty():
+            st.info("No quedan semanas de temporada regular en el horizonte.")
+        else:
+            mtp = mt.with_columns(etiqueta=pl.format("S{} · {}", "week", "rival")).to_pandas()
+            tip = [alt.Tooltip("etiqueta:N", title="Semana"), alt.Tooltip("p_ganar:Q", title="P(ganar)", format=".0%"),
+                   alt.Tooltip("yo_esperado:Q", title="Yo (esperado)", format=".1f"),
+                   alt.Tooltip("rival_esperado:Q", title="Rival (esperado)", format=".1f")]
+            bars = (alt.Chart(mtp).mark_bar(color=C_MODEL, cornerRadiusTopLeft=4, cornerRadiusTopRight=4, size=36)
+                    .encode(x=alt.X("etiqueta:N", title=None, sort=None, axis=alt.Axis(labelAngle=0, labelLimit=140)),
+                            y=alt.Y("p_ganar:Q", title="P(ganar)", scale=alt.Scale(domain=[0, 1]), axis=alt.Axis(format="%")),
+                            tooltip=tip))
+            half = alt.Chart().mark_rule(color="#8c8b87", strokeDash=[4, 4], strokeWidth=1).encode(y=alt.datum(0.5))
+            st.altair_chart((bars + half).properties(height=260), width="stretch", theme="streamlit")
+            st.dataframe(mt, hide_index=True, width="stretch",
+                         column_config={"week": "Semana", "p_ganar": st.column_config.NumberColumn("P(ganar)", format="percent"),
+                                        "yo_esperado": st.column_config.NumberColumn("Yo", format="%.1f"),
+                                        "rival_esperado": st.column_config.NumberColumn("Rival", format="%.1f")})
+            st.caption("Alineación óptima de los dos equipos. Para esta semana es más preciso el cálculo de la pestaña "
+                       "“Esta semana”, que usa tu alineación real y el rango de cada jugador.")
+
+    st.subheader("Byes y huecos")
+    st.caption("`T` titular en la óptima · `B` banca · `bye` · `fuera` (OUT/IR).")
+    st.dataframe(out["calendar"], hide_index=True, width="stretch")
+    needs = out["needs"]
+    if needs.is_empty():
+        st.success("Tu roster cubre todos los slots en lo que queda de temporada.")
+    else:
+        st.warning("**Huecos reales** (slots que tu roster no puede llenar) y el mejor agente libre disponible hoy:")
+        st.dataframe(needs, hide_index=True, width="stretch",
+                     column_config={"week": "Semana", "esperado": st.column_config.NumberColumn("Esperado", format="%.1f")})
+
+    st.subheader(f"Agentes libres para las próximas {horizon or 4} semanas")
+    st.caption("Cuánto suben tus puntos esperados en el horizonte si lo fichas (soltando a quien menos aporte si tu roster "
+               "está lleno). `Cubre byes`: semanas en que sería titular mientras uno de tus jugadores descansa.")
+    pk = out["pickups"].filter(pl.col("ganancia") > 0).head(12)
+    if pk.is_empty():
+        st.info("Ningún agente libre mejora tu roster en este horizonte.")
+    else:
+        st.dataframe(pk.with_columns(pl.col("semanas_titular", "cubre_byes").list.eval(pl.element().cast(pl.Utf8)).list.join(", ")),
+                     hide_index=True, width="stretch",
+                     column_config={"ganancia": st.column_config.NumberColumn("Ganancia (pts)", format="%+.1f"),
+                                    "esperado_horizonte": st.column_config.NumberColumn("Esperado en el horizonte", format="%.1f"),
+                                    "semanas_titular": "Semanas titular", "cubre_byes": "Cubre byes"})
 
 # ---------------------------------------------------------------- trades
 

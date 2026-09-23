@@ -465,7 +465,8 @@ def with_expected_points(proj: pl.DataFrame, rosters: pl.DataFrame, cal: LeagueC
 
 # ---------------------------------------------------------------- valor de un roster y de un trade
 
-def _week_lineup_points(wk: pl.DataFrame, cand: pl.DataFrame | None, slots: dict, score: str) -> float:
+def _week_lineup_points(wk: pl.DataFrame, cand: pl.DataFrame | None, slots: dict, score: str,
+                        fill_only_empty: bool = False) -> float:
     """Puntos esperados de la alineación óptima de una semana, con nivel de reemplazo.
 
     1. Titulares: los mejores disponibles entre el roster y los mejores agentes libres de cada posición
@@ -477,7 +478,7 @@ def _week_lineup_points(wk: pl.DataFrame, cand: pl.DataFrame | None, slots: dict
        entra el siguiente"; el Monte Carlo de la etapa (b) lo simula exactamente.
     """
     p_col = SCORE_PROB[score]
-    opt = L.optimal_lineup(wk, slots, score, cand)
+    opt = L.optimal_lineup(wk, slots, score, cand, fill_only_empty)
     pool = wk if cand is None else pl.concat([wk, cand.select(wk.columns)], how="vertical_relaxed")
     info = {r["espn_id"]: r for r in pool.to_dicts()}
     starters = set(opt["espn_id"].drop_nulls().to_list())
@@ -520,7 +521,8 @@ def _week_candidates(repl, week: int, exclude: list, score: str, per_position: i
     return cand.filter("available").sort(score, descending=True).group_by("position").head(per_position)
 
 
-def team_week_points(players: pl.DataFrame, slots: dict, score: str, repl=None, per_position: int = 3) -> pl.DataFrame:
+def team_week_points(players: pl.DataFrame, slots: dict, score: str, repl=None, per_position: int = 3,
+                     fill_only_empty: bool = False) -> pl.DataFrame:
     """Puntos esperados de la alineación óptima de un roster en cada semana (byes, lesiones, reemplazo).
 
     `repl`: agentes libres (proyección semanal, o el dict de prepare_replacements); se usan los
@@ -530,18 +532,18 @@ def team_week_points(players: pl.DataFrame, slots: dict, score: str, repl=None, 
     avail = lambda df: df.with_columns(available=~pl.col("bye") & pl.col(score).is_not_null() & (pl.col(score) > 0))
     for (week,), wk in players.partition_by("week", as_dict=True).items():
         cand = _week_candidates(repl, week, wk["espn_id"].to_list(), score, per_position)
-        rows.append({"week": week, "points": _week_lineup_points(avail(wk), cand, slots, score)})
+        rows.append({"week": week, "points": _week_lineup_points(avail(wk), cand, slots, score, fill_only_empty)})
     return pl.DataFrame(rows, schema={"week": pl.Int32, "points": pl.Float64}).sort("week")
 
 
-def weekly_lineups(players: pl.DataFrame, slots: dict, score: str, repl: pl.DataFrame | None = None,
-                   per_position: int = 3) -> pl.DataFrame:
+def weekly_lineups(players: pl.DataFrame, slots: dict, score: str, repl=None,
+                   per_position: int = 3, fill_only_empty: bool = False) -> pl.DataFrame:
     """Alineación óptima de cada semana: slot, jugador, origen (roster/reemplazo) y puntos esperados."""
     avail = lambda df: df.with_columns(available=~pl.col("bye") & pl.col(score).is_not_null() & (pl.col(score) > 0))
     out = []
     for (week,), wk in players.partition_by("week", as_dict=True).items():
         cand = _week_candidates(repl, week, wk["espn_id"].to_list(), score, per_position)
-        opt = L.optimal_lineup(avail(wk), slots, score, cand).with_row_index("orden")
+        opt = L.optimal_lineup(avail(wk), slots, score, cand, fill_only_empty).with_row_index("orden")
         pool = wk if cand is None else pl.concat([wk, cand.select(wk.columns)], how="vertical_relaxed")
         out.append(opt.join(pool.select("espn_id", "name", "position", score, "p_play"), on="espn_id", how="left")
                       .with_columns(week=pl.lit(week, pl.Int32)))
@@ -846,38 +848,51 @@ def simulate(players: pl.DataFrame, cal: LeagueCalendar, cfg: dict, unc: dict, n
     return Simulation(ids=ids, weeks=list(weeks), proj=proj, avail=avail, points=points)
 
 
-def _sim_lineup_points(sim: Simulation, roster: np.ndarray, fa: np.ndarray, positions: dict, slots: dict, j: int) -> np.ndarray:
+def _sim_lineup_points(sim: Simulation, roster: np.ndarray, fa: np.ndarray, positions: dict, slots: dict, j: int,
+                       fill_only_empty: bool = False) -> np.ndarray:
     """Puntos reales de la alineación en la semana j de cada simulación (S,).
 
     Cada simulación elige titulares entre los que juegan esa semana, por PROYECCIÓN (no por resultado:
     sin ver el futuro), entre el roster y los mejores agentes libres (misma regla que el determinista).
     """
     S = sim.avail.shape[0]
-    cand = np.concatenate([roster, fa]) if len(fa) else roster
-    cand = cand[np.argsort(-sim.proj[cand, j], kind="stable")]
+    by_proj = lambda ids: ids[np.argsort(-sim.proj[ids, j], kind="stable")] if len(ids) else ids
+    if fill_only_empty:   # primero el roster; los agentes libres solo para los slots que queden vacíos
+        cand = np.concatenate([by_proj(roster), by_proj(fa)])
+        is_fa = np.concatenate([np.zeros(len(roster), bool), np.ones(len(fa), bool)])
+        passes = (False, True)
+    else:                 # nivel de reemplazo: roster y agentes libres compiten por cada slot
+        cand = by_proj(np.concatenate([roster, fa]) if len(fa) else roster)
+        is_fa = np.zeros(len(cand), bool)
+        passes = (False,)
     cpos = np.array([positions[c] for c in cand])
     av = sim.avail[:, cand, j]
     pts = sim.points[:, cand, j]
     used = np.zeros_like(av)
+    slot_list = L.starting_slots(slots)
+    empty = np.ones((S, len(slot_list)), dtype=bool)
     total = np.zeros(S, dtype=np.float64)
     rows = np.arange(S)
-    for slot in L.starting_slots(slots):
-        elig = np.isin(cpos, list(L.FLEX_SLOTS.get(slot, {slot})))
-        ok = av & ~used & elig[None, :]
-        has = ok.any(axis=1)
-        idx = ok.argmax(axis=1)
-        used[rows[has], idx[has]] = True
-        total[has] += pts[rows[has], idx[has]]
+    for fa_pass in passes:
+        for k, slot in enumerate(slot_list):
+            elig = np.isin(cpos, list(L.FLEX_SLOTS.get(slot, {slot}))) & (is_fa == fa_pass)
+            ok = av & ~used & elig[None, :] & empty[:, k:k + 1]
+            has = ok.any(axis=1)
+            idx = ok.argmax(axis=1)
+            used[rows[has], idx[has]] = True
+            empty[has, k] = False
+            total[has] += pts[rows[has], idx[has]]
     return total
 
 
-def sim_roster_weekly(sim: Simulation, roster_ids, fa_by_week: dict, positions: dict, slots: dict) -> np.ndarray:
+def sim_roster_weekly(sim: Simulation, roster_ids, fa_by_week: dict, positions: dict, slots: dict,
+                      fill_only_empty: bool = False) -> np.ndarray:
     """Puntos reales de la alineación en cada simulación y semana (S, W), sin ponderar."""
     roster = sim.index(roster_ids)
     out = np.zeros((sim.avail.shape[0], len(sim.weeks)))
     for j, w in enumerate(sim.weeks):
         fa = sim.index([e for e in fa_by_week.get(w, []) if e not in set(roster_ids)])
-        out[:, j] = _sim_lineup_points(sim, roster, fa, positions, slots, j)
+        out[:, j] = _sim_lineup_points(sim, roster, fa, positions, slots, j, fill_only_empty)
     return out
 
 
