@@ -3,8 +3,10 @@
 .env.*
 !.env.example
 
-# Datos descargados (se regeneran con los notebooks)
-data/
+# Datos descargados (se regeneran con los notebooks), excepto el registro de predicciones,
+# que se versiona: los commits fechan cada predicción antes de los partidos
+data/*
+!data/predictions_log/
 
 # Python / Jupyter
 __pycache__/
