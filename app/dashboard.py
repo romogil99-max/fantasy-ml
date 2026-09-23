@@ -82,6 +82,9 @@ except RuntimeError as e:  # sin predicciones registradas para la semana
 week, rival = res["week"], res["info"]["rival"]
 a, o = res["actual"], res["optimal"]
 players = res["players"]
+SD = MU.player_sd(players, res["sims"])  # desviación de puntos por jugador (Monte Carlo, contando 0 si no juega)
+SD_HELP = ("Desviación estándar de sus puntos esta semana en el Monte Carlo, contando 0 si no juega. "
+           "Más alta = más incertidumbre (más techo y más riesgo). Si eres favorito conviene menos; si no, más.")
 
 tab_week, tab_lineup, tab_fa, tab_next, tab_trades, tab_model = st.tabs(
     ["📊 Esta semana", "📋 Mi alineación", "🆓 Agentes libres", "📅 Próximas semanas", "🔁 Trades", "🎯 ¿Qué tan bien va el modelo?"])
@@ -132,12 +135,13 @@ with tab_week:
 
     st.subheader(f"Alineación de {rival}")
     st.caption("Su alineación actual en ESPN; los huecos (vacío, OUT, IR, doubtful, bye) se cubren con su mejor suplente.")
-    st.dataframe(res["rival"].filter(pl.col("starter_slot").is_not_null())
+    st.dataframe(res["rival"].filter(pl.col("starter_slot").is_not_null()).join(SD, on="espn_id", how="left")
                  .select(slot="starter_slot", jugador="name", pos="position", lesion="injury",
-                         prediccion="pred_model", p10="pred_q10", p90="pred_q90", p_jugar="p_play", espn="espn_projection"),
+                         prediccion="pred_model", p10="pred_q10", p90="pred_q90", desv="desv", p_jugar="p_play", espn="espn_projection"),
                  hide_index=True, width="stretch",
                  column_config={c: st.column_config.NumberColumn(format="%.1f") for c in ("prediccion", "p10", "p90", "espn")}
-                 | {"p_jugar": st.column_config.NumberColumn("P(jugar)", format="percent")})
+                 | {"p_jugar": st.column_config.NumberColumn("P(jugar)", format="percent"),
+                    "desv": st.column_config.NumberColumn("Desv.", format="%.1f", help=SD_HELP)})
 
 # ---------------------------------------------------------------- mi alineación
 
@@ -145,14 +149,15 @@ with tab_lineup:
     st.header("Mi alineación")
     mine = res["mine_current"].join(res["mine_optimal"].select("espn_id", optima="starter_slot"), on="espn_id")
     order = {s: i for i, s in enumerate(["QB", "RB", "WR", "TE", "RB/WR/TE", "OP", "K", "D/ST", "BE", "IR"])}
-    table = (mine.with_columns(_o=pl.col("slot").replace_strict(order, default=99))
+    table = (mine.join(SD, on="espn_id", how="left").with_columns(_o=pl.col("slot").replace_strict(order, default=99))
                  .sort("_o", pl.col("pred_model"), descending=[False, True], nulls_last=True)
                  .select(slot="slot", jugador="name", pos="position", lesion="injury", prediccion="pred_model",
-                         p10="pred_q10", p90="pred_q90", espn="espn_projection", p_jugar="p_play",
+                         p10="pred_q10", p90="pred_q90", desv="desv", espn="espn_projection", p_jugar="p_play",
                          en_la_optima=pl.col("optima").is_not_null()))
     st.dataframe(table, hide_index=True, width="stretch",
                  column_config={c: st.column_config.NumberColumn(format="%.1f") for c in ("prediccion", "p10", "p90", "espn")}
                  | {"p_jugar": st.column_config.NumberColumn("P(jugar)", format="percent"),
+                    "desv": st.column_config.NumberColumn("Desv.", format="%.1f", help=SD_HELP),
                     "en_la_optima": st.column_config.CheckboxColumn("¿Titular en la óptima?"),
                     "p10": st.column_config.NumberColumn("P10", format="%.1f", help="8 de cada 10 veces sus puntos caen entre P10 y P90"),
                     "p90": st.column_config.NumberColumn("P90", format="%.1f")})

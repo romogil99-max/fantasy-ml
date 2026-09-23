@@ -247,6 +247,16 @@ def close_decisions(me_team: pl.DataFrame, rival_team: pl.DataFrame, sims: dict,
                                       "error_mc_diferencia": pl.Float64, "conviene_hoy": pl.Utf8, "decide": pl.Utf8})
 
 
+def player_sd(players: pl.DataFrame, sims: dict) -> pl.DataFrame:
+    """Desviación estándar de los puntos simulados de cada jugador, contando 0 si no juega.
+
+    Incluye el riesgo de no jugar (un questionable tiene más desviación que un sano con el mismo rango).
+    Partidos ya terminados: 0.
+    """
+    sd = {e: float(np.std(np.where(plays, pts, 0.0))) for e, (pts, plays) in sims.items()}
+    return players.select("espn_id").with_columns(desv=pl.col("espn_id").replace_strict(sd, default=None, return_dtype=pl.Float64))
+
+
 def range_consistency(players: pl.DataFrame, sims: dict) -> pl.DataFrame:
     """Compara, jugador por jugador, los percentiles 10/90 simulados (si juega) con su rango P10–P90."""
     rows = []
