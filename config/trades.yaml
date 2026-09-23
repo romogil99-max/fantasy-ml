@@ -1,0 +1,31 @@
+# Analizador de trades (src/fantasy_ml/trades.py, notebook 06).
+# Las semanas de temporada regular y de playoffs, la fecha límite de trades, los slots y los límites
+# por posición NO van aquí: se leen de la configuración de la liga en ESPN en cada ejecución.
+
+# Peso de cada semana de playoffs en el valor de un roster (temporada regular = 1).
+playoff_weight: 2.0
+
+# Tamaño máximo del roster sin contar el slot de IR (ESPN: 15 + 1 IR).
+max_active_roster: 15
+
+# Probabilidad de jugar ESTA semana según el estado de lesión de ESPN (las siguientes usan la tasa histórica).
+status_play_prob:
+  OUT: 0.0
+  SUSPENSION: 0.0
+  DOUBTFUL: 0.25
+  QUESTIONABLE: 0.75
+
+# Jugadores en IR (ESPN INJURY_RESERVE, slot IR o estado RES en nflverse): semanas que se asumen fuera.
+ir_weeks: 4
+
+# Tasa histórica de partidos jugados: jugadores relevantes (xfp medio >= min_xfp en las semanas 1-4)
+# y partidos jugados de su equipo desde la semana 5.
+availability:
+  seasons: [2023, 2024, 2025]
+  min_xfp: 8.0
+
+# Líneas de apuestas de semanas futuras (aún no publicadas): modelo de fuerza ofensiva/defensiva
+# ajustado a las líneas ya publicadas, con la temporada anterior como referencia de menor peso.
+lines:
+  ridge_lambda: 3.0
+  prev_season_weight: 0.25

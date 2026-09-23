@@ -137,34 +137,43 @@ def team_offense(team_games: pl.DataFrame, team_stats: pl.DataFrame, upcoming: t
 
 # ---------------------------------------------------------------- filas de la semana a predecir
 
-def upcoming_offense(rosters_weekly, team_games, base, season: int, week: int) -> pl.DataFrame:
-    """Jugadores activos (status ACT) de QB/RB/WR/TE en los rosters de nflverse para esa semana."""
+def upcoming_offense(rosters_weekly, team_games, base, season: int, week: int,
+                     statuses=("ACT",), require_game: bool = True) -> pl.DataFrame:
+    """QB/RB/WR/TE de los rosters de nflverse para esa semana (por defecto: activos y con partido).
+
+    require_game=False incluye a los que no juegan esa semana (bye) con rival nulo: sirve para
+    obtener el estado actual de sus features y proyectarlos en semanas posteriores.
+    """
     games = team_games.filter(pl.col("season") == season, pl.col("week") == week).select(*KEYS, "team", opponent_team="opponent")
     return (rosters_weekly
-        .filter(pl.col("season") == season, pl.col("week") == week, pl.col("status") == "ACT",
+        .filter(pl.col("season") == season, pl.col("week") == week, pl.col("status").is_in(list(statuses)),
                 pl.col("position").is_in(POS), pl.col("gsis_id").is_not_null())
         .select(*INT_KEYS, player_id="gsis_id", player_display_name="full_name", position="position", team="team")
         .unique(["player_id"])
-        .join(games, on=[*KEYS, "team"])  # sin partido esa semana (bye) = sin fila
+        .join(games, on=[*KEYS, "team"], how="inner" if require_game else "left")
         .join(base.select("player_id", *KEYS), on=["player_id", *KEYS], how="anti")
         .with_columns(from_snaps_only=pl.lit(False)))
 
 
-def upcoming_k(rosters_weekly, team_games, points_k, season: int, week: int) -> pl.DataFrame:
+def upcoming_k(rosters_weekly, team_games, points_k, season: int, week: int,
+               statuses=("ACT",), require_game: bool = True) -> pl.DataFrame:
     games = team_games.filter(pl.col("season") == season, pl.col("week") == week).select(*KEYS, "team", opponent_team="opponent")
     return (rosters_weekly
-        .filter(pl.col("season") == season, pl.col("week") == week, pl.col("status") == "ACT",
+        .filter(pl.col("season") == season, pl.col("week") == week, pl.col("status").is_in(list(statuses)),
                 pl.col("position") == "K", pl.col("gsis_id").is_not_null())
         .select(*INT_KEYS, player_id="gsis_id", player_display_name="full_name", team="team")
         .unique(["player_id"])
-        .join(games, on=[*KEYS, "team"])
+        .join(games, on=[*KEYS, "team"], how="inner" if require_game else "left")
         .join(points_k.select("player_id", *KEYS), on=["player_id", *KEYS], how="anti"))
 
 
-def upcoming_dst(team_games, points_dst, season: int, week: int) -> pl.DataFrame:
-    return (team_games.filter(pl.col("season") == season, pl.col("week") == week)
-        .select(*KEYS, "game_id", "team", "opponent")
-        .join(points_dst.select("team", *KEYS), on=["team", *KEYS], how="anti"))
+def upcoming_dst(team_games, points_dst, season: int, week: int, require_game: bool = True) -> pl.DataFrame:
+    games = team_games.filter(pl.col("season") == season, pl.col("week") == week).select(*KEYS, "game_id", "team", "opponent")
+    if not require_game:  # las 32 defensas; las que descansan quedan con rival nulo
+        teams = team_games.filter(pl.col("season") == season).select("team").unique()
+        games = teams.with_columns(season=pl.lit(season, pl.Int32), week=pl.lit(week, pl.Int32)).join(
+            games, on=[*KEYS, "team"], how="left")
+    return games.join(points_dst.select("team", *KEYS), on=["team", *KEYS], how="anti")
 
 
 # ---------------------------------------------------------------- features
@@ -198,15 +207,34 @@ def _roll_feats(df) -> list[str]:
     return [c for c in df.columns if c.endswith(ROLL_SUFFIXES)]
 
 
+def ppr_allowed(base: pl.DataFrame) -> pl.DataFrame:
+    """Puntos PPR permitidos por cada defensa a cada posición y partido (nulo si la semana no se ha jugado)."""
+    y = pl.col("fantasy_points_ppr")
+    return (base.group_by(*KEYS, "opponent_team", "position")
+                .agg(opp_ppr_allowed=pl.when(y.is_not_null().any()).then(y.sum()))
+                .rename({"opponent_team": "defense"}))
+
+
+def latest_rolling(df, key, cols, season: int, windows=(5,)) -> pl.DataFrame:
+    """Valor que tendrían hoy las features de add_rolling (sin _prev) para el próximo partido de cada `key`.
+
+    Equivale a add_rolling evaluado en una fila nueva al final: media de los últimos w partidos
+    (cruzando temporadas) y media de la temporada `season` hasta hoy (nula si aún no jugó en ella).
+    """
+    key = [key] if isinstance(key, str) else list(key)
+    done = df.filter(pl.all_horizontal(pl.col(c).is_not_null() for c in cols)).sort(*key, *KEYS)
+    aggs = []
+    for c in cols:
+        aggs += [pl.col(c).tail(w).mean().alias(f"{c}_l{w}") for w in windows]
+        aggs.append(pl.col(c).filter(pl.col("season") == season).mean().alias(f"{c}_std"))
+    return done.group_by(key).agg(aggs)
+
+
 def build_offense(base: pl.DataFrame, context: pl.DataFrame) -> pl.DataFrame:
     f = add_counts(add_rolling(base, "player_id", OFF_ROLL), "player_id")
 
-    # Puntos PPR permitidos por cada defensa a cada posición (nulo si la semana no se ha jugado)
     y = pl.col("fantasy_points_ppr")
-    allowed = (base.group_by(*KEYS, "opponent_team", "position")
-                   .agg(opp_ppr_allowed=pl.when(y.is_not_null().any()).then(y.sum()))
-                   .rename({"opponent_team": "defense"}))
-    allowed = add_rolling(allowed, ["defense", "position"], ["opp_ppr_allowed"], windows=(5,), prev_season=False)
+    allowed = add_rolling(ppr_allowed(base), ["defense", "position"], ["opp_ppr_allowed"], windows=(5,), prev_season=False)
 
     f = (f.join(allowed.drop("opp_ppr_allowed"), left_on=[*KEYS, "opponent_team", "position"],
                 right_on=[*KEYS, "defense", "position"], how="left")
