@@ -2,7 +2,7 @@
 
 Predicting weekly fantasy football points for the players in my ESPN league (full PPR), and checking whether a model can beat ESPN's own projections.
 
-> **Status: work in progress.** Data, features, a weekly walk-forward backtest, a weekly predictions log, a lineup helper and the first two stages of a trade analyzer are done. The 2026 comparison against ESPN is accumulating week by week in `data/predictions_log/`.
+> **Status: work in progress.** Data, features, a weekly walk-forward backtest, a weekly predictions log, a lineup helper and a trade analyzer (evaluation, uncertainty and trade finder) are done. The 2026 comparison against ESPN is accumulating week by week in `data/predictions_log/`.
 
 ## Stack
 
@@ -109,10 +109,15 @@ The log is append-only and only records games that haven't started. It can be re
 
 `notebooks/06_trades.ipynb` values a trade for **both teams** as the change in expected points of each team's optimal lineup from now to week 17. Byes are included, and playoff weeks count double; the playoff weeks and the trade deadline are read from the league settings. Each player is projected week by week: current form features are frozen, each week's matchup context is swapped in, and betting lines not yet published are estimated from a team-strength model (1.2-point error on implied totals). A Monte Carlo over 2,000 seasons gives each estimate an 80% interval and a probability that the trade helps each team. It samples real errors from a horizon backtest (projection error grows from 5.7 to 6.6 points of SD between 1 and 10+ weeks ahead) and simulates availability as a Markov chain. ESPN's projections are shown alongside, as a proxy for how the other manager will see the trade.
 
+The **trade finder** searches the other 9 rosters for 1-for-1 and 2-for-1 trades (both directions) where both teams gain. The search space has about 30,000 trades, so it runs in three steps. First, an additive screen built from marginal values (what each team loses by giving each player and gains by receiving each candidate, minus the player it would have to drop). This screen correlates 0.82–0.87 with the exact values. Second, an exact valuation of the ~800 best candidates, discarding redundant variants of simpler trades. Third, Monte Carlo and ESPN's view for the top 30.
+
 ## Findings
 
 - **Individual injury history barely predicts future availability.** Only games missed while inactive or on a reserve list count; backup roles and week 18 rest are excluded. On that basis, each player's history (2023–2025) was blended with his position's rate, with the blend strength chosen by how well it predicted the next season. The best strength weighs the position rate like **~300 games**, and it improves on the position rate alone by **less than 0.1%**. Splitting positions by usage level did not help either (0.2%). What *does* matter is that absences come in streaks: a player who missed a game misses the next one 84% of the time. Short inactive stints end quickly (32% return the following week), while reserve/IR stints rarely do (96% stay out). So a healthy player's availability over the next few weeks is much higher than his season-long rate.
-- **Replacement level changes the value of bench players a lot in a 10-team league.** With only 10 teams the waiver wire is deep: in 2026 week 3 the best free-agent QBs project 14–17 points. An empty slot (bye, injury) is filled with the best free agent at that position, and a starter who may not play is backed up by his bench or a free agent. Once that is modelled, a backup's value as bye/injury insurance mostly disappears. In the example trade (my backup QB Brock Purdy for WR Nico Collins), the other team went from **+29.7** without replacement level to **−20.3** with it, while my side went from +12.2 to +38.5. The trade flips from "both teams win" to "only I win".
+- **Replacement level changes the value of bench players a lot in a 10-team league.** With only 10 teams the waiver wire is deep: in 2026 week 3 the best free-agent QBs project 14–17 points. The best free agents at each position compete for every lineup slot, so a player is worth only what he adds over them. On top of that, a starter who may not play is backed up by his bench or a free agent. Once that is modelled, a backup's value as bye/injury insurance mostly disappears. In the example trade (my backup QB Brock Purdy for WR Nico Collins), the other team went from **+50.0** without replacement level to **−4.8** with it, while my side went from +16.9 to +23.9. For the trade I was actually considering (Purdy for RB TreVeyon Henderson), my side went from −21.5 to −1.1: a coin flip, with a 48% chance of helping me.
+
+  Getting this right required letting free agents compete for *every* slot, not only empty ones. The first version filled only empty slots, so removing a starter who was worse than the best free agent made a team *more* valuable: +47.6 points for dropping one team's D/ST. The trade finder then suggested trades whose only "benefit" was getting rid of such players. The current rule is monotone: removing any of the 154 rostered players never increases a roster's value.
+- **With replacement level, trades rarely move the needle.** Even the best trades the finder proposes are worth about 10 weighted points over 15 weeks for each side, under one point per week. Their probability of helping each team is only 50–57%. In this league the rosters are close to efficient given what the waiver wire offers.
 
 ## Limitations
 
@@ -121,7 +126,7 @@ The log is append-only and only records games that haven't started. It can be re
 - **K and D/ST scoring** is computed from nflverse stats and validated against ESPN's actual 2026 points (K 64/64 games, D/ST 63/64; the one mismatch is a sack credited differently by the two sources). The same rules are assumed for 2023–2025.
 - **ESPN comparison in the backtest** covers only players on a league roster in 2026 weeks 1–2, because ESPN does not keep past projections for everyone else.
 - **Trade analyzer:**
-  - It assumes the best free agent is still available when a slot needs filling, and that both teams can use him. That is reasonable in a 10-team league, but optimistic.
+  - It assumes the best free agents (top 3 per position each week) are available whenever they beat a rostered player, and that every team can use them. That means unlimited streaming with no waiver competition. It is reasonable in a 10-team league, but optimistic.
   - It ignores the probability of making the playoffs, since playoff weeks are simply weighted ×2.
   - It ignores correlation between players on the same NFL team.
   - Future betting lines are estimated rather than observed.
@@ -133,8 +138,8 @@ The log is append-only and only records games that haven't started. It can be re
 - [x] **03_backtest**: weekly walk-forward for 2024–2026, hyperparameters tuned on 2024 only, error by position and failure analysis
 - [x] **04_predicciones**: weekly pre-game predictions log with ESPN projections
 - [x] **05_alineacion** (quick version): optimal lineup, start/sit changes flagged when inconclusive (< 3 points), top free agents by lineup gain
-- [ ] **06_trades**
+- [x] **06_trades**
   - [x] (a) week-by-week rest-of-season projections and evaluation of a specific trade for both teams
   - [x] (b) uncertainty: horizon backtest and Monte Carlo
-  - [ ] (c) search for 1-for-1 and 2-for-1 trades where both teams gain
+  - [x] (c) search for 1-for-1 and 2-for-1 trades where both teams gain
 - [ ] **05_alineacion** (full version): prediction ranges and multi-week analysis
