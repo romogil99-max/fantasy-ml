@@ -11,6 +11,7 @@ Predicting weekly fantasy football points for the players in my ESPN league (ful
 - [`espn-api`](https://github.com/cwendt94/espn-api): league settings, rosters and ESPN projections
 - [`polars`](https://pola.rs/): data wrangling
 - [`LightGBM`](https://lightgbm.readthedocs.io/): gradient-boosted trees
+- [`Streamlit`](https://streamlit.io/) and [`Altair`](https://altair-viz.github.io/): dashboard
 - [`nbstripout`](https://github.com/kynan/nbstripout): keeps notebook outputs out of git
 
 ## Repository layout
@@ -27,6 +28,10 @@ src/fantasy_ml/          # shared code used by every notebook
   lineup.py              #   optimal lineup from the league's slots, start/sit changes, replacement level
   trades.py              #   rest-of-season projections, availability model, trade values, Monte Carlo
   matchup.py             #   win probability against this week's opponent (also a CLI for the Sunday run)
+  report.py              #   predictions log vs actual points (model and ESPN error)
+app/dashboard.py         # Streamlit dashboard (probabilities, predictions, suggestions)
+scripts/run_weekly_predictions.sh  # weekly automated run: notebook 04, Sunday win probability, commit + push
+systemd/                 # user units: weekly predictions timer and dashboard service
 config/scoring.yaml      # full league scoring rules (offense, K, D/ST)
 config/validation.yaml   # validation scheme (weekly walk-forward, tuning season)
 config/model.yaml        # frozen hyperparameters and the search that chose them
@@ -121,6 +126,32 @@ The log is append-only and only records games that haven't started. It can be re
 - **Close decisions:** for start/sit choices within 3 expected points, it shows the lower-variance option (right when favoured), the higher-variance option (right when not favoured) and the option with the higher win probability this week.
 - **Sunday run:** the automated run appends the result to `winprob_<season>.csv`, alongside ESPN's own win probability.
 
+## Dashboard
+
+`app/dashboard.py` is a Streamlit app with one page and five tabs:
+
+| Tab | What it shows |
+|---|---|
+| This week | Win probability with my current lineup, the optimal lineup and ESPN's; expected points with 80% ranges; the logged win-probability history; the opponent's lineup with holes filled |
+| My lineup | Each player's prediction, P10–P90 range, ESPN projection, injury status and whether he starts in the optimal lineup, plus close start/sit decisions |
+| Free agents | Top 5 per position, ranked by how much each one improves my optimal lineup |
+| Trades | Latest trade-finder results, with a button to run it again (~6 min) |
+| How is the model doing? | 2026 error of the model vs ESPN by position, and real coverage of the P10–P90 ranges, from the predictions log |
+
+ESPN data is fetched live and cached for 10 minutes; a sidebar button refreshes it. Predictions come from the predictions log, so they match what was committed before each game.
+
+Run it once with `streamlit run app/dashboard.py`, or keep it running as a user service that starts at boot and restarts on failure:
+
+```bash
+export XDG_RUNTIME_DIR=/run/user/$(id -u)   # needed when the shell has no user session bus
+ln -sf ~/fantasy-ml/systemd/fantasy-dashboard.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now fantasy-dashboard.service
+# then open http://<server-ip>:8501
+```
+
+> ⚠ **The dashboard has no authentication.** The service listens on `0.0.0.0:8501`, so anyone on the local network can see the league, my roster and the other teams. Never forward that port on the router. To restrict it to the server itself, change `--server.address` to `127.0.0.1` in the service and use an SSH tunnel (`ssh -L 8501:localhost:8501 user@server`).
+
 ## Trade analyzer
 
 `notebooks/06_trades.ipynb` values a trade for **both teams** as the change in expected points of each team's optimal lineup from now to week 17. Byes are included, and playoff weeks count double; the playoff weeks and the trade deadline are read from the league settings. Each player is projected week by week: current form features are frozen, each week's matchup context is swapped in, and betting lines not yet published are estimated from a team-strength model (1.2-point error on implied totals). A Monte Carlo over 2,000 seasons gives each estimate an 80% interval and a probability that the trade helps each team. It samples real errors from a horizon backtest (projection error grows from 5.7 to 6.6 points of SD between 1 and 10+ weeks ahead) and simulates availability as a Markov chain. ESPN's projections are shown alongside, as a proxy for how the other manager will see the trade.
@@ -141,6 +172,7 @@ The **trade finder** searches the other 9 rosters for 1-for-1 and 2-for-1 trades
 - **The model assumes the player plays.** Targets exist only for games played. The model predicts points *if active*; availability (injuries, inactives) is handled outside the model, and the log keeps ESPN's injury status for that purpose.
 - **K and D/ST scoring** is computed from nflverse stats and validated against ESPN's actual 2026 points (K 64/64 games, D/ST 63/64; the one mismatch is a sack credited differently by the two sources). The same rules are assumed for 2023–2025.
 - **ESPN comparison in the backtest** covers only players on a league roster in 2026 weeks 1–2, because ESPN does not keep past projections for everyone else.
+- **The dashboard has no authentication:** keep it on the local network only.
 - **Win probability** treats players as independent. It ignores QB–receiver stacks and the negative link between a D/ST and the opposing offense, so probabilities are somewhat too extreme.
 - **Trade analyzer:**
   - It assumes the best free agents (top 3 per position each week) are available whenever they beat a rostered player, and that every team can use them. That means unlimited streaming with no waiver competition. It is reasonable in a 10-team league, but optimistic.
@@ -159,6 +191,7 @@ The **trade finder** searches the other 9 rosters for 1-for-1 and 2-for-1 trades
   - [x] calibrated P10–P90 ranges per player, logged before each game
   - [x] win probability against this week's opponent, with favourite/underdog picks for close decisions (automated on Sundays)
   - [ ] multi-week analysis
+- [x] **Dashboard**: Streamlit app with win probability, lineup, free agents, trades and model tracking
 - [x] **06_trades**
   - [x] (a) week-by-week rest-of-season projections and evaluation of a specific trade for both teams
   - [x] (b) uncertainty: horizon backtest and Monte Carlo
