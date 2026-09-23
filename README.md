@@ -26,17 +26,19 @@ src/fantasy_ml/          # shared code used by every notebook
   predictions_log.py     #   append-only log of pre-game predictions
   lineup.py              #   optimal lineup from the league's slots, start/sit changes, replacement level
   trades.py              #   rest-of-season projections, availability model, trade values, Monte Carlo
+  matchup.py             #   win probability against this week's opponent (also a CLI for the Sunday run)
 config/scoring.yaml      # full league scoring rules (offense, K, D/ST)
 config/validation.yaml   # validation scheme (weekly walk-forward, tuning season)
 config/model.yaml        # frozen hyperparameters and the search that chose them
 config/trades.yaml       # trade analyzer settings (playoff weight, injury status, availability, lines)
+config/ranges.yaml       # per-position calibration of the P10–P90 ranges (fit on 2024, verified on 2025)
 notebooks/01_datos.ipynb
 notebooks/02_features.ipynb
 notebooks/03_backtest.ipynb
 notebooks/04_predicciones.ipynb   # run weekly, before the games (automated with a systemd timer)
-notebooks/05_alineacion.ipynb     # optimal lineup, start/sit changes and free agents
+notebooks/05_alineacion.ipynb     # lineup, P10–P90 ranges, free agents and win probability
 notebooks/06_trades.ipynb         # trade analyzer
-data/predictions_log/    # versioned: one CSV per season
+data/predictions_log/    # versioned: predictions (<season>.csv) and Sunday win probabilities (winprob_<season>.csv)
 .env.example             # ESPN credentials template (the real .env is gitignored)
 ```
 
@@ -105,6 +107,20 @@ Metrics focus on **fantasy-relevant players**: each week, the top 24 QB, 48 RB, 
 
 The log is append-only and only records games that haven't started. It can be re-run (for example on Sunday morning after injury news); evaluation uses the last prediction made before each kickoff. The log is committed so git history timestamps each prediction. ESPN does not keep past weekly projections for every player, so this log is the only way to compare against ESPN over a full season.
 
+## Ranges and win probability
+
+**P10–P90 ranges.** Two LightGBM quantile models (α = 0.1 and 0.9), with the same frozen hyperparameters and features, give each player a range; crossed quantiles are swapped, though none occurred in 15,615 backtest predictions. Raw ranges were too narrow for K and D/ST (~74% coverage). A per-position conformal adjustment was fit on 2024 and checked on 2025: coverage for fantasy-relevant players is **80–85% at every position**. The weekly predictions log stores each player's range before kickoff, so 2026 coverage can be measured too.
+
+**Win probability against this week's opponent** (`matchup.py`, notebook 05):
+- **Lineups:** mine is my current ESPN lineup, with the optimal one shown as an alternative. The opponent's is their current lineup, with empty slots and out/IR/doubtful/bye starters replaced by their best available bench player.
+- **Simulation (10,000 runs):**
+  - each player plays according to his ESPN status;
+  - points are drawn from real out-of-sample residuals, scaled so each player's simulated P10–P90 matches his own range and centred on his prediction;
+  - a starter who sits is replaced from the bench;
+  - games already finished use actual points.
+- **Close decisions:** for start/sit choices within 3 expected points, it shows the lower-variance option (right when favoured), the higher-variance option (right when not favoured) and the option with the higher win probability this week.
+- **Sunday run:** the automated run appends the result to `winprob_<season>.csv`, alongside ESPN's own win probability.
+
 ## Trade analyzer
 
 `notebooks/06_trades.ipynb` values a trade for **both teams** as the change in expected points of each team's optimal lineup from now to week 17. Byes are included, and playoff weeks count double; the playoff weeks and the trade deadline are read from the league settings. Each player is projected week by week: current form features are frozen, each week's matchup context is swapped in, and betting lines not yet published are estimated from a team-strength model (1.2-point error on implied totals). A Monte Carlo over 2,000 seasons gives each estimate an 80% interval and a probability that the trade helps each team. It samples real errors from a horizon backtest (projection error grows from 5.7 to 6.6 points of SD between 1 and 10+ weeks ahead) and simulates availability as a Markov chain. ESPN's projections are shown alongside, as a proxy for how the other manager will see the trade.
@@ -125,6 +141,7 @@ The **trade finder** searches the other 9 rosters for 1-for-1 and 2-for-1 trades
 - **The model assumes the player plays.** Targets exist only for games played. The model predicts points *if active*; availability (injuries, inactives) is handled outside the model, and the log keeps ESPN's injury status for that purpose.
 - **K and D/ST scoring** is computed from nflverse stats and validated against ESPN's actual 2026 points (K 64/64 games, D/ST 63/64; the one mismatch is a sack credited differently by the two sources). The same rules are assumed for 2023–2025.
 - **ESPN comparison in the backtest** covers only players on a league roster in 2026 weeks 1–2, because ESPN does not keep past projections for everyone else.
+- **Win probability** treats players as independent. It ignores QB–receiver stacks and the negative link between a D/ST and the opposing offense, so probabilities are somewhat too extreme.
 - **Trade analyzer:**
   - It assumes the best free agents (top 3 per position each week) are available whenever they beat a rostered player, and that every team can use them. That means unlimited streaming with no waiver competition. It is reasonable in a 10-team league, but optimistic.
   - It ignores the probability of making the playoffs, since playoff weeks are simply weighted ×2.
@@ -137,9 +154,12 @@ The **trade finder** searches the other 9 rosters for 1-for-1 and 2-for-1 trades
 - [x] **02_features**: K and D/ST points validated against ESPN; rolling form, usage, expected points, game context and opponent features, with an automated test for future data leaking into them
 - [x] **03_backtest**: weekly walk-forward for 2024–2026, hyperparameters tuned on 2024 only, error by position and failure analysis
 - [x] **04_predicciones**: weekly pre-game predictions log with ESPN projections
-- [x] **05_alineacion** (quick version): optimal lineup, start/sit changes flagged when inconclusive (< 3 points), top free agents by lineup gain
+- [x] **05_alineacion**
+  - [x] optimal lineup, start/sit changes flagged when inconclusive (< 3 points), top free agents by lineup gain
+  - [x] calibrated P10–P90 ranges per player, logged before each game
+  - [x] win probability against this week's opponent, with favourite/underdog picks for close decisions (automated on Sundays)
+  - [ ] multi-week analysis
 - [x] **06_trades**
   - [x] (a) week-by-week rest-of-season projections and evaluation of a specific trade for both teams
   - [x] (b) uncertainty: horizon backtest and Monte Carlo
   - [x] (c) search for 1-for-1 and 2-for-1 trades where both teams gain
-- [ ] **05_alineacion** (full version): prediction ranges and multi-week analysis
