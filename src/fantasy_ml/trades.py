@@ -22,6 +22,8 @@ from .data import KEYS
 # defaultPositionId de ESPN → posición (para los límites por posición del roster)
 ESPN_POSITION_IDS = {1: "QB", 2: "RB", 3: "WR", 4: "TE", 5: "K", 16: "D/ST"}
 IR_STATUSES = {"INJURY_RESERVE", "IR"}
+# Cada puntaje = proyección si juega x probabilidad de jugar (columna de probabilidad asociada)
+SCORE_PROB = {"exp_points": "p_play", "espn_points": "p_espn"}
 STATE_STATUSES = ("ACT", "RES", "INA", "EXE")  # estados de nflverse con los que se construye el estado actual (EXE = exento)
 
 
@@ -81,62 +83,125 @@ def league_rosters(league) -> pl.DataFrame:
     return pl.DataFrame(rows)
 
 
+def league_free_agents(league, week: int, size: int = 100) -> pl.DataFrame:
+    """Agentes libres de ESPN (mismas columnas que league_rosters, sin equipo de fantasy)."""
+    rows = []
+    for pos in ["QB", "RB", "WR", "TE", "K", "D/ST"]:
+        for p in league.free_agents(week=week, size=size, position=pos):
+            status = p.injuryStatus if isinstance(p.injuryStatus, str) else None
+            rows.append({"fantasy_team_id": None, "fantasy_team": None, "espn_id": p.playerId, "name": p.name,
+                         "position": p.position, "pro_team": F.ESPN_TO_NFLVERSE.get(p.proTeam, p.proTeam),
+                         "lineup_slot": None, "injury_status": status, "espn_avg_proj": float(p.projected_avg_points or 0.0)})
+    return pl.DataFrame(rows, schema_overrides={"fantasy_team_id": pl.Int64, "fantasy_team": pl.Utf8, "lineup_slot": pl.Utf8}).unique("espn_id")
+
+
 # ---------------------------------------------------------------- disponibilidad
 
-TIERS = ["bajo", "medio", "alto"]
+PLAYED, MISSED, ROLE = "jugó", "perdido", "rol"
 
 
-def availability_rates(base: pl.DataFrame, points_k: pl.DataFrame, team_games: pl.DataFrame, cfg: dict) -> pl.DataFrame:
-    """Fracción de partidos de su equipo que juega un jugador relevante, por posición y nivel de uso.
+def availability_history(rosters_weekly: pl.DataFrame, base: pl.DataFrame, points_k: pl.DataFrame,
+                         team_games: pl.DataFrame, max_week: int = 17) -> pl.DataFrame:
+    """Una fila por jugador y partido de su equipo (temporada regular, semanas <= max_week).
 
-    Relevante: jugó en las semanas 1-4 con xfp medio >= min_xfp (K: al menos 2 partidos). Se cuentan
-    sus partidos desde la semana 5 contra los de su equipo en ese tramo. Incluye lesiones y pérdidas
-    de rol: para fantasy, ambas valen 0 puntos. El nivel (bajo/medio/alto) son los terciles de xfp de
-    cada posición; importa sobre todo en QB (los de más uso pierden muchos menos partidos).
-    Devuelve el xfp medio de cada nivel para interpolar la tasa de los jugadores actuales.
+    outcome:
+    - "jugó": tiene registro de snaps/estadísticas ese partido.
+    - "perdido": estaba inactivo (INA) o en reserva/lesionados (RES) y no jugó → lesión o inactividad.
+    - "rol": estaba activo (ACT) pero no jugó (suplente, banqueado). No cuenta como disponible ni
+      como perdido: es cuestión de rol, no de salud. Se excluye del cálculo de disponibilidad.
+    La semana 18 se excluye (descansos de fin de temporada; la liga termina en la 17). Solo cuentan
+    semanas en que su equipo jugó (sin byes) y en que el jugador estaba en el equipo (no cortado).
+    """
+    games = team_games.filter(pl.col("week") <= max_week).select("season", "week", "team").unique()
+    weeks = (rosters_weekly
+        .filter(pl.col("game_type") == "REG", pl.col("week") <= max_week, pl.col("gsis_id").is_not_null(),
+                pl.col("position").is_in(F.POS + ["K"]), pl.col("status").is_in(["ACT", "INA", "RES"]))
+        .select(*F.INT_KEYS, player_id="gsis_id", position="position", team="team", status="status")
+        .unique(["season", "week", "player_id"], keep="first")
+        .join(games, on=["season", "week", "team"]))
+    played = pl.concat([base.select("season", "week", "player_id"), points_k.select("season", "week", "player_id")]).unique()
+    return (weeks.join(played.with_columns(_p=pl.lit(True)), on=["season", "week", "player_id"], how="left")
+                 .with_columns(outcome=pl.when(pl.col("_p")).then(pl.lit(PLAYED))
+                                         .when(pl.col("status").is_in(["INA", "RES"])).then(pl.lit(MISSED))
+                                         .otherwise(pl.lit(ROLE)))
+                 .drop("_p"))
+
+
+def availability_rates(history: pl.DataFrame, base: pl.DataFrame, cfg: dict) -> pl.DataFrame:
+    """Tasa base de partidos jugados (jugados / (jugados + perdidos)) por posición.
+
+    Se calcula con jugadores relevantes (xfp medio >= min_xfp en las semanas 1-4 de la temporada) y sus
+    partidos desde la semana 5. K: kickers con al menos 2 partidos en las semanas 1-4. D/ST: 1.
+    Es la referencia (prior) hacia la que se contrae el historial de cada jugador. Separar además por
+    nivel de uso (xfp) no mejoró la predicción de forma apreciable (notebook 06), así que no se hace.
     """
     seasons, min_xfp = cfg["seasons"], cfg["min_xfp"]
-    team_n = (team_games.filter(pl.col("season").is_in(seasons), pl.col("week") >= 5)
-              .group_by("season", "team").agg(pl.len().alias("team_games")))
-
-    def played(df, rel):
-        n = (df.filter(pl.col("season").is_in(seasons), pl.col("week") >= 5)
-               .group_by("season", "player_id").agg(pl.len().alias("played")))
-        return (rel.join(team_n, on=["season", "team"]).join(n, on=["season", "player_id"], how="left")
-                   .with_columns(pl.col("played").fill_null(0).clip(upper_bound=pl.col("team_games"))))
-
-    early = base.filter(pl.col("season").is_in(seasons), pl.col("week") <= 4)
-    off = played(base, early.group_by("season", "player_id")
-                            .agg(pl.col("team").sort_by("week").last(), pl.col("position").last(), pl.col("xfp").mean())
-                            .filter(pl.col("xfp") >= min_xfp))
-    off = off.with_columns(tier=pl.col("xfp").qcut([1 / 3, 2 / 3], labels=TIERS).cast(pl.Utf8).over("position"))
-    off_rates = (off.group_by("position", "tier")
-                    .agg(pl.len().alias("player_seasons"), pl.col("xfp").mean().alias("xfp_center"),
-                         (pl.col("played").sum() / pl.col("team_games").sum()).alias("play_rate")))
-
-    early_k = points_k.filter(pl.col("season").is_in(seasons), pl.col("week") <= 4)
-    k = played(points_k, early_k.group_by("season", "player_id").agg(pl.col("team").sort_by("week").last(), pl.len().alias("n"))
-                                .filter(pl.col("n") >= 2))
-    k_rates = pl.DataFrame({"position": ["K"], "tier": [None], "player_seasons": [k.height], "xfp_center": [None],
-                            "play_rate": [k["played"].sum() / k["team_games"].sum()]})
-    dst = pl.DataFrame({"position": ["D/ST"], "tier": [None], "player_seasons": [None], "xfp_center": [None], "play_rate": [1.0]})
-    return pl.concat([off_rates, k_rates, dst], how="vertical_relaxed").sort("position", "xfp_center", nulls_last=True)
+    h = history.filter(pl.col("season").is_in(seasons), pl.col("outcome") != ROLE)
+    relevant = (base.filter(pl.col("season").is_in(seasons), pl.col("week") <= 4)
+                    .group_by("season", "player_id").agg(pl.col("position").last(), pl.col("xfp").mean())
+                    .filter(pl.col("xfp") >= min_xfp).select("season", "player_id", "position"))
+    k_early = h.filter(pl.col("position") == "K", pl.col("week") <= 4, pl.col("outcome") == PLAYED).group_by("season", "player_id").len()
+    relevant = pl.concat([relevant, k_early.filter(pl.col("len") >= 2).select("season", "player_id", position=pl.lit("K"))])
+    rates = (h.filter(pl.col("week") >= 5).drop("position").join(relevant, on=["season", "player_id"])
+              .group_by("position").agg(pl.col("season").n_unique().alias("seasons"),
+                                        pl.struct("season", "player_id").n_unique().alias("player_seasons"),
+                                        pl.len().alias("games"), (pl.col("outcome") == PLAYED).mean().alias("play_rate")))
+    dst = pl.DataFrame({"position": ["D/ST"], "seasons": [None], "player_seasons": [None], "games": [None], "play_rate": [1.0]})
+    return pl.concat([rates, dst], how="vertical_relaxed").sort("position")
 
 
-def assign_play_rate(df: pl.DataFrame, rates: pl.DataFrame) -> pl.DataFrame:
-    """Tasa de partidos jugados según posición y xfp actual (xfp_l5), interpolando linealmente entre
-    el xfp medio de cada nivel (fuera del rango se usa el nivel extremo). Evita saltos bruscos en los cortes.
-    Sin xfp (novatos, K, D/ST) se usa la tasa del nivel medio o la de la posición.
+def prior_play_rate(df: pl.DataFrame, rates: pl.DataFrame) -> pl.Series:
+    """Tasa base de la posición de cada jugador."""
+    return df.join(rates.select("position", prior_rate="play_rate"), on="position", how="left")["prior_rate"]
+
+
+def shrinkage_strength(history: pl.DataFrame, base: pl.DataFrame, rates: pl.DataFrame, cfg: dict,
+                       grid=(5, 10, 20, 40, 80, 120, 200, 300, 500, 1000)) -> tuple[float, pl.DataFrame]:
+    """Peso κ (en partidos) de la tasa base frente al historial del jugador, elegido por capacidad predictiva.
+
+    Para cada temporada T (desde la segunda de `seasons`): con el historial de las temporadas anteriores
+    se predice la disponibilidad de los jugadores relevantes en T (semanas 5-17) y se mide el error
+    cuadrático ponderado por partidos. Se elige el κ con menor error. Se evita el método de momentos
+    porque las lesiones vienen en rachas (una rotura = muchos partidos perdidos seguidos) y eso infla la
+    diferencia aparente entre jugadores.
+    Devuelve (κ, tabla de error por κ).
     """
-    tiered = rates.filter(pl.col("tier").is_not_null()).sort("xfp_center")
-    flat = rates.filter(pl.col("tier").is_null()).select("position", "play_rate")
-    curves = {pos: (g["xfp_center"].to_numpy(), g["play_rate"].to_numpy())
-              for (pos,), g in tiered.partition_by("position", as_dict=True).items()}
-    rate = [float(np.interp(x if x is not None else np.median(curves[p][0]), *curves[p])) if p in curves else None
-            for p, x in zip(df["position"], df["xfp_l5"])]
-    return (df.with_columns(play_rate=pl.Series(rate, dtype=pl.Float64))
-              .join(flat.rename({"play_rate": "_flat"}), on="position", how="left")
-              .with_columns(play_rate=pl.coalesce("play_rate", "_flat")).drop("_flat"))
+    seasons, min_xfp = cfg["seasons"], cfg["min_xfp"]
+    h = history.filter(pl.col("outcome") != ROLE)
+    rows = []
+    for target in seasons[1:]:
+        rel = (base.filter(pl.col("season") == target, pl.col("week") <= 4)
+                   .group_by("player_id").agg(pl.col("position").last(), pl.col("xfp").mean())
+                   .filter(pl.col("xfp") >= min_xfp))
+        actual = (h.filter(pl.col("season") == target, pl.col("week") >= 5)
+                   .group_by("player_id").agg((pl.col("outcome") == PLAYED).mean().alias("actual"), pl.len().alias("n_target")))
+        past = (h.filter(pl.col("season") < target)
+                 .group_by("player_id").agg((pl.col("outcome") == PLAYED).sum().alias("p"), (pl.col("outcome") == MISSED).sum().alias("m")))
+        d = rel.join(actual, on="player_id").join(past, on="player_id", how="left").with_columns(pl.col("p", "m").fill_null(0))
+        d = d.with_columns(prior_play_rate(d, rates))
+        for k in grid:
+            pred = (d["p"] + k * d["prior_rate"]) / (d["p"] + d["m"] + k)
+            rows.append({"season": target, "kappa": k, "sse": float(((pred - d["actual"]) ** 2 * d["n_target"]).sum()),
+                         "games": int(d["n_target"].sum())})
+    res = (pl.DataFrame(rows).group_by("kappa").agg((pl.col("sse").sum() / pl.col("games").sum()).sqrt().alias("rmse"))
+             .sort("kappa"))
+    return float(res.sort("rmse")["kappa"][0]), res
+
+
+def player_play_rate(df: pl.DataFrame, history: pl.DataFrame, rates: pl.DataFrame, kappa: float) -> pl.DataFrame:
+    """Tasa de partidos jugados de cada jugador: su historial contraído hacia la tasa de su posición y nivel.
+
+    rate = (jugados + κ·tasa_base) / (jugados + perdidos + κ). Sin historial, rate = tasa_base.
+    Necesita las columnas entity_id (gsis_id; equipo en D/ST) y position.
+    """
+    own = (history.filter(pl.col("outcome") != ROLE)
+                  .group_by("player_id").agg((pl.col("outcome") == PLAYED).sum().alias("hist_played"),
+                                             (pl.col("outcome") == MISSED).sum().alias("hist_missed")))
+    df = (df.with_columns(prior_play_rate(df, rates))
+            .join(own.rename({"player_id": "entity_id"}), on="entity_id", how="left")
+            .with_columns(pl.col("hist_played", "hist_missed").fill_null(0)))
+    return df.with_columns(play_rate=pl.when(pl.col("position") == "D/ST").then(1.0).otherwise(
+        (pl.col("hist_played") + kappa * pl.col("prior_rate")) / (pl.col("hist_played") + pl.col("hist_missed") + kappa)))
 
 
 def play_probability(cal: LeagueCalendar, cfg: dict) -> pl.Expr:
@@ -149,6 +214,13 @@ def play_probability(cal: LeagueCalendar, cfg: dict) -> pl.Expr:
               .when(on_ir & (wk < now + cfg["ir_weeks"])).then(0.0)
               .when(wk == now).then(this_week)
               .otherwise(pl.col("play_rate")))
+
+
+def add_play_rates(proj: pl.DataFrame, history: pl.DataFrame, rates: pl.DataFrame, kappa: float) -> pl.DataFrame:
+    """Añade a la proyección la tasa de partidos jugados de cada jugador (constante en todas las semanas)."""
+    ents = proj.select("entity_id", "position").unique("entity_id")
+    pr = player_play_rate(ents, history, rates, kappa).select("entity_id", "prior_rate", "hist_played", "hist_missed", "play_rate")
+    return proj.join(pr, on="entity_id", how="left")
 
 
 # ---------------------------------------------------------------- líneas de apuestas futuras
@@ -297,9 +369,10 @@ def project_rest_of_season(state: dict, params: dict, cal: LeagueCalendar, cfg: 
     return proj
 
 
-def with_expected_points(proj: pl.DataFrame, rosters: pl.DataFrame, rates: pl.DataFrame,
-                         cal: LeagueCalendar, cfg: dict) -> pl.DataFrame:
-    """Cruza la proyección con los rosters de la liga y añade probabilidad de jugar y puntos esperados.
+def with_expected_points(proj: pl.DataFrame, rosters: pl.DataFrame, cal: LeagueCalendar, cfg: dict) -> pl.DataFrame:
+    """Cruza la proyección (que ya trae `play_rate` por jugador) con un roster y añade puntos esperados.
+
+    `rosters` puede ser el de la liga (league_rosters) o el de agentes libres (league_free_agents).
 
     - exp_points: proyección del modelo x probabilidad de jugar (lo que se usa para valorar).
     - espn_points: media por partido de ESPN si juega esa semana (lo que ve el otro manager).
@@ -307,37 +380,77 @@ def with_expected_points(proj: pl.DataFrame, rosters: pl.DataFrame, rates: pl.Da
     """
     status_p = cfg["status_play_prob"]
     wk, now = pl.col("week"), cal.current_week
-    df = assign_play_rate(rosters.join(proj.drop("position", "name"), on="espn_id", how="left"), rates) \
-        .with_columns(bye=pl.col("bye").fill_null(True))
+    df = rosters.join(proj.drop("position", "name"), on="espn_id", how="left").with_columns(bye=pl.col("bye").fill_null(True))
     on_ir = pl.col("injury_status").is_in(list(IR_STATUSES)) | (pl.col("lineup_slot") == "IR") | (pl.col("nfl_status") == "RES")
     known_out = (pl.when(pl.col("bye")).then(0.0)
                    .when(on_ir & (wk < now + cfg["ir_weeks"])).then(0.0)
                    .when(wk == now).then(pl.col("injury_status").replace_strict(status_p, default=1.0, return_dtype=pl.Float64))
                    .otherwise(1.0))
-    return (df.with_columns(p_play=play_probability(cal, cfg))
+    return (df.with_columns(p_play=play_probability(cal, cfg), p_espn=known_out)
               .with_columns(exp_points=pl.col("proj") * pl.col("p_play"),
-                            espn_points=pl.col("espn_avg_proj") * known_out))
+                            espn_points=pl.col("espn_avg_proj") * pl.col("p_espn")))
 
 
 # ---------------------------------------------------------------- valor de un roster y de un trade
 
-def team_week_points(players: pl.DataFrame, slots: dict, score: str) -> pl.DataFrame:
-    """Puntos de la alineación óptima de un roster en cada semana (con byes y lesiones)."""
+def _week_lineup_points(wk: pl.DataFrame, cand: pl.DataFrame | None, slots: dict, score: str) -> float:
+    """Puntos esperados de la alineación óptima de una semana, con nivel de reemplazo.
+
+    1. Titulares: los mejores disponibles del roster; los slots vacíos (bye, OUT, IR) se rellenan con el
+       mejor agente libre de esa posición (lineup.optimal_lineup con `replacements`).
+    2. Un titular con probabilidad de jugar p < 1 aporta p·proyección + (1−p)·(mejor reemplazo): el
+       mejor jugador de la banca o agente libre elegible para ese slot que no sea titular. Cada
+       reemplazo se usa para un solo titular. Es la aproximación en valor esperado de "si no juega,
+       entra el siguiente"; el Monte Carlo de la etapa (b) lo simula exactamente.
+    """
+    p_col = SCORE_PROB[score]
+    opt = L.optimal_lineup(wk, slots, score, cand)
+    pool = wk if cand is None else pl.concat([wk, cand.select(wk.columns)], how="vertical_relaxed")
+    info = {r["espn_id"]: r for r in pool.to_dicts()}
+    starters = set(opt["espn_id"].drop_nulls().to_list())
+    backups = sorted((r for r in info.values() if r["available"] and r["espn_id"] not in starters and r[score] is not None),
+                     key=lambda r: -r[score])
+    total, used = 0.0, set()
+    # primero los titulares con más riesgo: son los que más necesitan un buen reemplazo
+    rows = sorted((r for r in opt.to_dicts() if r["espn_id"] is not None), key=lambda r: info[r["espn_id"]][p_col])
+    for r in rows:
+        me = info[r["espn_id"]]
+        total += me[score]
+        p = me[p_col]
+        if p < 1:
+            allowed = L.FLEX_SLOTS.get(r["slot"], {r["slot"]})
+            fb = next((b for b in backups if b["espn_id"] not in used and b["position"] in allowed), None)
+            if fb:
+                used.add(fb["espn_id"])
+                total += (1 - p) * fb[score]
+    return total
+
+
+def team_week_points(players: pl.DataFrame, slots: dict, score: str, repl: pl.DataFrame | None = None,
+                     per_position: int = 3) -> pl.DataFrame:
+    """Puntos esperados de la alineación óptima de un roster en cada semana (byes, lesiones, reemplazo).
+
+    `repl`: agentes libres (proyección semanal); se usan los `per_position` mejores de cada posición.
+    """
     rows = []
+    avail = lambda df: df.with_columns(available=~pl.col("bye") & pl.col(score).is_not_null() & (pl.col(score) > 0))
     for (week,), wk in players.partition_by("week", as_dict=True).items():
-        wk = wk.with_columns(available=~pl.col("bye") & pl.col(score).is_not_null() & (pl.col(score) > 0))
-        rows.append({"week": week, "points": L.lineup_points(wk, slots, score)})
+        cand = None
+        if repl is not None:
+            cand = avail(repl.filter(pl.col("week") == week, ~pl.col("espn_id").is_in(wk["espn_id"].to_list())))
+            cand = cand.filter("available").sort(score, descending=True).group_by("position").head(per_position)
+        rows.append({"week": week, "points": _week_lineup_points(avail(wk), cand, slots, score)})
     return pl.DataFrame(rows, schema={"week": pl.Int32, "points": pl.Float64}).sort("week")
 
 
-def roster_value(players: pl.DataFrame, slots: dict, cal: LeagueCalendar, score: str) -> dict:
-    wp = team_week_points(players, slots, score).join(cal.weights(), on="week")
+def roster_value(players: pl.DataFrame, slots: dict, cal: LeagueCalendar, score: str, repl: pl.DataFrame | None = None) -> dict:
+    wp = team_week_points(players, slots, score, repl).join(cal.weights(), on="week")
     return {"value": (wp["points"] * wp["weight"]).sum(),
             "regular": wp.filter(pl.col("phase") == "regular")["points"].sum(),
             "playoffs": wp.filter(pl.col("phase") == "playoffs")["points"].sum()}
 
 
-def _apply_roster_limits(players: pl.DataFrame, incoming: set, rules: dict, cfg: dict, cal, score):
+def _apply_roster_limits(players: pl.DataFrame, incoming: set, rules: dict, cfg: dict, cal, score, repl=None):
     """Si sobran jugadores activos, suelta al que menos valor aporta (nunca a uno recién recibido).
 
     Devuelve (roster, jugador soltado o None, motivo de invalidez o None).
@@ -345,9 +458,9 @@ def _apply_roster_limits(players: pl.DataFrame, incoming: set, rules: dict, cfg:
     active = players.filter(pl.col("lineup_slot") != "IR").select("espn_id").unique().height
     dropped = None
     if active > cfg["max_active_roster"]:
-        base_val = roster_value(players, rules["slots"], cal, score)["value"]
+        base_val = roster_value(players, rules["slots"], cal, score, repl)["value"]
         candidates = players.filter(~pl.col("espn_id").is_in(list(incoming)), pl.col("lineup_slot") != "IR")["espn_id"].unique()
-        losses = {pid: base_val - roster_value(players.filter(pl.col("espn_id") != pid), rules["slots"], cal, score)["value"]
+        losses = {pid: base_val - roster_value(players.filter(pl.col("espn_id") != pid), rules["slots"], cal, score, repl)["value"]
                   for pid in candidates}
         drop_id = min(losses, key=losses.get)
         dropped = players.filter(pl.col("espn_id") == drop_id)["name"][0]
@@ -359,7 +472,7 @@ def _apply_roster_limits(players: pl.DataFrame, incoming: set, rules: dict, cfg:
 
 
 def rosters_after_trade(league_proj: pl.DataFrame, me: int, other: int, gives: list[int], gets: list[int],
-                        rules: dict, cal: LeagueCalendar, cfg: dict, score: str = "exp_points"):
+                        rules: dict, cal: LeagueCalendar, cfg: dict, score: str = "exp_points", repl=None):
     """Roster de `me` antes y después de dar `gives` y recibir `gets` (espn_id), aplicando límites.
 
     Los jugadores recibidos entran a la banca (slot BE), así que cuentan para el límite de activos.
@@ -369,18 +482,21 @@ def rosters_after_trade(league_proj: pl.DataFrame, me: int, other: int, gives: l
     received = (league_proj.filter(pl.col("fantasy_team_id") == other, pl.col("espn_id").is_in(gets))
                            .with_columns(fantasy_team_id=pl.lit(me), lineup_slot=pl.lit("BE")))
     after = pl.concat([before.filter(~pl.col("espn_id").is_in(gives)), received], how="vertical_relaxed")
-    after, dropped, invalid = _apply_roster_limits(after, set(gets), rules, cfg, cal, score)
+    after, dropped, invalid = _apply_roster_limits(after, set(gets), rules, cfg, cal, score, repl)
     return before, after, dropped, invalid
 
 
 def evaluate_trade(league_proj: pl.DataFrame, team_a: int, team_b: int, a_gives: list[int], b_gives: list[int],
-                   rules: dict, cal: LeagueCalendar, cfg: dict, score: str = "exp_points") -> pl.DataFrame:
-    """Cambio en el valor del roster de cada equipo si A da `a_gives` y B da `b_gives` (espn_id)."""
+                   rules: dict, cal: LeagueCalendar, cfg: dict, score: str = "exp_points", repl=None) -> pl.DataFrame:
+    """Cambio en el valor del roster de cada equipo si A da `a_gives` y B da `b_gives` (espn_id).
+
+    `repl`: proyección semanal de agentes libres para rellenar slots vacíos (nivel de reemplazo).
+    """
     rows = []
     names = lambda ids, df: ", ".join(df.filter(pl.col("espn_id").is_in(ids))["name"].unique(maintain_order=True).to_list())
     for me, other, gives, gets in ((team_a, team_b, a_gives, b_gives), (team_b, team_a, b_gives, a_gives)):
-        before, after, dropped, invalid = rosters_after_trade(league_proj, me, other, gives, gets, rules, cal, cfg, score)
-        v0, v1 = roster_value(before, rules["slots"], cal, score), roster_value(after, rules["slots"], cal, score)
+        before, after, dropped, invalid = rosters_after_trade(league_proj, me, other, gives, gets, rules, cal, cfg, score, repl)
+        v0, v1 = roster_value(before, rules["slots"], cal, score, repl), roster_value(after, rules["slots"], cal, score, repl)
         rows.append({"fantasy_team_id": me, "fantasy_team": before["fantasy_team"][0],
                      "da": names(gives, before), "recibe": names(gets, league_proj), "suelta": dropped,
                      "valor_antes": round(v0["value"], 1), "valor_despues": round(v1["value"], 1),
@@ -392,11 +508,11 @@ def evaluate_trade(league_proj: pl.DataFrame, team_a: int, team_b: int, a_gives:
 
 
 def weekly_trade_breakdown(league_proj: pl.DataFrame, me: int, other: int, gives: list[int], gets: list[int],
-                           rules: dict, cal: LeagueCalendar, cfg: dict, score: str = "exp_points") -> pl.DataFrame:
+                           rules: dict, cal: LeagueCalendar, cfg: dict, score: str = "exp_points", repl=None) -> pl.DataFrame:
     """Puntos de la alineación óptima de `me` semana a semana, antes y después del trade."""
-    before, after, _, _ = rosters_after_trade(league_proj, me, other, gives, gets, rules, cal, cfg, score)
-    b = team_week_points(before, rules["slots"], score).rename({"points": "antes"})
-    a = team_week_points(after, rules["slots"], score).rename({"points": "despues"})
+    before, after, _, _ = rosters_after_trade(league_proj, me, other, gives, gets, rules, cal, cfg, score, repl)
+    b = team_week_points(before, rules["slots"], score, repl).rename({"points": "antes"})
+    a = team_week_points(after, rules["slots"], score, repl).rename({"points": "despues"})
     return (b.join(a, on="week").join(cal.weights(), on="week")
              .with_columns(delta=pl.col("despues") - pl.col("antes"))
              .with_columns(delta_ponderado=pl.col("delta") * pl.col("weight")))

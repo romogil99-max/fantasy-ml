@@ -19,12 +19,16 @@ def starting_slots(slot_counts: dict) -> list[str]:
     return fixed + flex
 
 
-def optimal_lineup(players: pl.DataFrame, slot_counts: dict, score: str) -> pl.DataFrame:
+def optimal_lineup(players: pl.DataFrame, slot_counts: dict, score: str,
+                   replacements: pl.DataFrame | None = None) -> pl.DataFrame:
     """Asigna los mejores jugadores disponibles a cada slot según `score`.
 
     Rellenar primero los slots fijos y después los flexibles es óptimo aquí, porque cada slot
     flexible acepta un superconjunto de las posiciones de los fijos.
     `players` necesita: espn_id, position, available (bool) y la columna `score`.
+
+    `replacements` (opcional, mismas columnas): agentes libres que SOLO rellenan los slots que quedan
+    vacíos (nadie del roster disponible para esa posición: bye, lesión). Columna `source`: roster/reemplazo.
     """
     pool = (players.filter(pl.col("available"), pl.col(score).is_not_null())
                    .sort(score, descending=True).to_dicts())
@@ -34,10 +38,18 @@ def optimal_lineup(players: pl.DataFrame, slot_counts: dict, score: str) -> pl.D
         pick = next((p for p in pool if p["espn_id"] not in used and p["position"] in allowed), None)
         if pick:
             used.add(pick["espn_id"])
-            rows.append({"slot": slot, "espn_id": pick["espn_id"]})
-        else:
-            rows.append({"slot": slot, "espn_id": None})
-    return pl.DataFrame(rows, schema={"slot": pl.Utf8, "espn_id": pl.Int64})
+        rows.append({"slot": slot, "espn_id": pick["espn_id"] if pick else None, "source": "roster" if pick else None})
+    if replacements is not None and any(r["espn_id"] is None for r in rows):
+        repl = (replacements.filter(pl.col("available"), pl.col(score).is_not_null(), ~pl.col("espn_id").is_in(list(used)))
+                            .sort(score, descending=True).to_dicts())
+        for r in rows:
+            if r["espn_id"] is None:
+                allowed = FLEX_SLOTS.get(r["slot"], {r["slot"]})
+                pick = next((p for p in repl if p["espn_id"] not in used and p["position"] in allowed), None)
+                if pick:
+                    used.add(pick["espn_id"])
+                    r["espn_id"], r["source"] = pick["espn_id"], "reemplazo"
+    return pl.DataFrame(rows, schema={"slot": pl.Utf8, "espn_id": pl.Int64, "source": pl.Utf8})
 
 
 def lineup_changes(roster: pl.DataFrame, optimal: pl.DataFrame, score: str, threshold: float) -> pl.DataFrame:
@@ -71,10 +83,13 @@ def lineup_changes(roster: pl.DataFrame, optimal: pl.DataFrame, score: str, thre
                                       "diferencia": pl.Float64, "concluyente": pl.Boolean})
 
 
-def lineup_points(players: pl.DataFrame, slot_counts: dict, score: str) -> float:
-    """Puntos totales (según `score`) de la alineación óptima."""
-    opt = optimal_lineup(players, slot_counts, score)
+def lineup_points(players: pl.DataFrame, slot_counts: dict, score: str,
+                  replacements: pl.DataFrame | None = None) -> float:
+    """Puntos totales (según `score`) de la alineación óptima (con reemplazos opcionales en slots vacíos)."""
+    opt = optimal_lineup(players, slot_counts, score, replacements)
     pts = dict(zip(players["espn_id"].to_list(), players[score].to_list()))
+    if replacements is not None:
+        pts = {**dict(zip(replacements["espn_id"].to_list(), replacements[score].to_list())), **pts}
     return sum(pts[i] for i in opt["espn_id"].drop_nulls().to_list())
 
 

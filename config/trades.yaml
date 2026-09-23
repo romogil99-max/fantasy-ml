@@ -18,8 +18,11 @@ status_play_prob:
 # Jugadores en IR (ESPN INJURY_RESERVE, slot IR o estado RES en nflverse): semanas que se asumen fuera.
 ir_weeks: 4
 
-# Tasa histórica de partidos jugados: jugadores relevantes (xfp medio >= min_xfp en las semanas 1-4)
-# y partidos jugados de su equipo desde la semana 5.
+# Probabilidad de jugar a futuro. Solo cuentan como perdidos los partidos de su equipo en que el jugador
+# estaba inactivo (INA) o en reserva/lesionados (RES), en temporada regular hasta la semana 17. Estar
+# activo sin jugar (suplente) es rol, no salud, y se excluye. Tasa base por posición con jugadores
+# relevantes (xfp medio >= min_xfp en las semanas 1-4, partidos desde la semana 5); el historial de cada
+# jugador se contrae hacia ella con un peso κ (en partidos) elegido por validación predictiva.
 availability:
   seasons: [2023, 2024, 2025]
   min_xfp: 8.0
