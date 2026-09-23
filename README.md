@@ -2,7 +2,7 @@
 
 Predicting weekly fantasy football points for the players in my ESPN league (full PPR), and checking whether a model can beat ESPN's own projections.
 
-> **Status: work in progress.** Notebook 01 (data ingestion) is done; notebook 02 is in progress (K and D/ST scoring done). Modeling has not started yet, so there are no results to report.
+> **Status: work in progress.** Notebook 01 (data ingestion) is done; notebook 02 (K/D/ST scoring and features) is done. Modeling has not started yet, so there are no results to report.
 
 ## Stack
 
@@ -63,9 +63,9 @@ The league was created in 2026, so ESPN projections exist only for 2026.
 ## Roadmap
 
 - [x] **01_datos**: download weekly stats, connect to the league, validate scoring rules, and join the roster with ESPN projections through nflverse IDs
-- [ ] **02_features**
+- [x] **02_features**
   - [x] K and D/ST points from `scoring.yaml`, validated against ESPN
-  - [ ] rolling usage and matchup features without future data leaking into them
+  - [x] rolling form, usage, expected points, game context and opponent features, with an automated test for future data leaking into them
 - [ ] **03_baseline**: rolling-average baseline on the walk-forward folds; ESPN projections on 2026
 - [ ] **04_modelo**: per-position models evaluated on the same walk-forward folds, then compared against ESPN on 2026
 - [ ] **05_lineup**: generate weekly predictions and start/sit recommendations for my roster
