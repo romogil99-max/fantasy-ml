@@ -118,3 +118,80 @@ def search(df: pl.DataFrame, group: str, grid: dict, season: int, verbose=True) 
         if verbose:
             print(f"  {group} {params} → MAE relevantes {rows[-1]['mae_relevant']:.3f} ({rows[-1]['seconds']}s)")
     return pl.DataFrame(rows).sort("mae_relevant")
+
+
+# ---------------------------------------------------------------- rangos (regresión por cuantiles)
+
+QUANTILES = (0.1, 0.9)
+
+
+def fit_quantile(train: pl.DataFrame, group: str, params: dict, alpha: float) -> lgb.LGBMRegressor:
+    """LightGBM con pérdida de cuantil `alpha` y los mismos hiperparámetros congelados que el modelo de media."""
+    X, names = design_matrix(train, group)
+    model = lgb.LGBMRegressor(**{**FIXED_PARAMS, "objective": "quantile", "alpha": alpha}, **params)
+    model.fit(X, train["y"].to_numpy(), feature_name=names)
+    return model
+
+
+def predict_range(models: tuple, df: pl.DataFrame, group: str, calibration: dict | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """P10 y P90 de cada fila. Nunca se cruzan: si P10 > P90, se intercambian.
+
+    `calibration` (opcional): {posición: (ajuste_inferior, ajuste_superior)} en puntos, estimado en otra
+    temporada (calibrate_ranges): P10 − ajuste_inferior, P90 + ajuste_superior.
+    """
+    lo, hi = predict(models[0], df, group), predict(models[1], df, group)
+    lo, hi = np.minimum(lo, hi), np.maximum(lo, hi)
+    if calibration:
+        pos = with_position(df, group)["position"].to_list()
+        adj = np.array([calibration.get(p, (0.0, 0.0)) for p in pos])
+        lo, hi = lo - adj[:, 0], hi + adj[:, 1]
+    return lo, hi
+
+
+def walk_forward_ranges(df: pl.DataFrame, group: str, params: dict, weeks, verbose=False) -> pl.DataFrame:
+    """Walk-forward semanal de los cuantiles: para cada semana entrena con las anteriores y predice P10/P90.
+
+    Incluye cuántas veces se cruzaron los dos modelos antes de ordenarlos (`crossed`).
+    """
+    out = []
+    for season, week in weeks:
+        train = df.filter(before(season, week), pl.col("y").is_not_null())
+        test = df.filter(pl.col("season") == season, pl.col("week") == week, pl.col("y").is_not_null())
+        if test.is_empty():
+            continue
+        models = tuple(fit_quantile(train, group, params, a) for a in QUANTILES)
+        raw_lo, raw_hi = predict(models[0], test, group), predict(models[1], test, group)
+        lo, hi = predict_range(models, test, group)
+        keep = [c for c in dict.fromkeys(["season", "week", GROUPS[group]["entity"], "player_display_name", "team", "position", "y"])
+                if c in with_position(test, group).columns]
+        out.append(with_position(test, group).select(keep)
+                   .with_columns(q10=pl.Series(lo), q90=pl.Series(hi), crossed=pl.Series(raw_lo > raw_hi)))
+        if verbose:
+            print(f"  {group} {season} sem {week:>2}")
+    return pl.concat(out, how="diagonal_relaxed")
+
+
+def range_coverage(r: pl.DataFrame, by: list[str]) -> pl.DataFrame:
+    """Cobertura del rango: % dentro [P10, P90] (objetivo 80), % por debajo y por encima (objetivo 10 cada uno)."""
+    return (r.group_by(by)
+             .agg(pl.len().alias("n"),
+                  ((pl.col("y") >= pl.col("q10")) & (pl.col("y") <= pl.col("q90"))).mean().mul(100).round(1).alias("pct_dentro"),
+                  (pl.col("y") < pl.col("q10")).mean().mul(100).round(1).alias("pct_debajo"),
+                  (pl.col("y") > pl.col("q90")).mean().mul(100).round(1).alias("pct_encima"),
+                  (pl.col("q90") - pl.col("q10")).mean().round(2).alias("ancho_medio"))
+             .sort(by))
+
+
+def calibrate_ranges(r: pl.DataFrame, target_tail: float = 0.10) -> dict:
+    """Ajuste por posición para que cada cola tenga `target_tail` (calibración conformal, estilo CQR).
+
+    ajuste_inferior = cuantil (1 − target_tail) de (P10 − y); ajuste_superior = ídem de (y − P90). Si el
+    rango ya es demasiado ancho, el ajuste sale negativo y lo estrecha. Se estima en una temporada y
+    se aplica a otra.
+    """
+    cal = {}
+    for (pos,), g in r.partition_by("position", as_dict=True).items():
+        lo = float(np.quantile((g["q10"] - g["y"]).to_numpy(), 1 - target_tail))
+        hi = float(np.quantile((g["y"] - g["q90"]).to_numpy(), 1 - target_tail))
+        cal[pos] = (round(lo, 3), round(hi, 3))
+    return cal

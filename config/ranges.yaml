@@ -1,0 +1,26 @@
+# Generado por notebooks/05_alineacion.ipynb (RECALIBRATE=True). Ajuste por posición (en puntos)
+# de los rangos P10–P90: [restar a P10, sumar a P90]. Estimado con 2024, verificado con 2025.
+quantiles:
+- 0.1
+- 0.9
+calibrated_on: 2024
+verified_on: 2025
+calibration:
+  QB:
+  - 0.061
+  - 2.011
+  TE:
+  - 0.0
+  - -0.495
+  WR:
+  - 0.0
+  - 0.126
+  RB:
+  - -0.0
+  - 0.369
+  K:
+  - 0.621
+  - 1.194
+  D/ST:
+  - 1.143
+  - 0.964
