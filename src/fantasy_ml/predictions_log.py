@@ -20,6 +20,8 @@ LOG_SCHEMA = {
     "team": pl.Utf8, "opponent": pl.Utf8, "kickoff_utc": pl.Datetime("us", "UTC"),
     "pred_model": pl.Float64, "pred_baseline": pl.Float64, "espn_projection": pl.Float64,
     "espn_injury_status": pl.Utf8, "on_my_roster": pl.Boolean, "my_slot": pl.Utf8,
+    # Rango P10–P90 (regresión por cuantiles calibrada). Añadido el 2026-09-23: vacío en filas anteriores.
+    "pred_q10": pl.Float64, "pred_q90": pl.Float64,
 }
 ENTITY = ["season", "week", "group", "entity_id"]
 
@@ -49,9 +51,31 @@ def kickoff_utc(team_games: pl.DataFrame) -> pl.Expr:
               .dt.replace_time_zone("America/New_York").dt.convert_time_zone("UTC"))
 
 
+def ensure_schema(path) -> bool:
+    """Si el CSV no tiene alguna columna nueva del esquema, la añade vacía al final (migración única).
+
+    Es la única excepción a "solo agregar filas": no cambia ningún valor existente, solo la cabecera
+    y una columna vacía por columna nueva. Devuelve True si migró.
+    """
+    if not path.exists():
+        return False
+    with path.open(encoding="utf-8") as f:
+        header = f.readline().rstrip("\n").split(",")
+    missing = [c for c in LOG_SCHEMA if c not in header]
+    if not missing:
+        return False
+    if header != list(LOG_SCHEMA)[:len(header)]:
+        raise ValueError(f"Columnas de {path} en orden inesperado: no se migra automáticamente")
+    lines = path.read_text(encoding="utf-8").splitlines()
+    out = [",".join(header + missing)] + [line + "," * len(missing) for line in lines[1:]]
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    return True
+
+
 def append(rows: pl.DataFrame, now: datetime | None = None) -> pl.DataFrame:
     """Agrega al registro las filas cuyo partido aún no empieza. Devuelve lo que se registró."""
     now = now or datetime.now(timezone.utc)
+    rows = rows.with_columns([pl.lit(None, dtype=t).alias(c) for c, t in LOG_SCHEMA.items() if c not in rows.columns])
     rows = (rows.with_columns(generated_at_utc=pl.lit(now).cast(LOG_SCHEMA["generated_at_utc"]),
                               code_version=pl.lit(code_version()))
                 .select([pl.col(c).cast(t) for c, t in LOG_SCHEMA.items()]))
@@ -61,6 +85,7 @@ def append(rows: pl.DataFrame, now: datetime | None = None) -> pl.DataFrame:
     for season, part in pregame.partition_by("season", as_dict=True).items():
         path = log_path(season[0])
         path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_schema(path)
         new_file = not path.exists()
         with path.open("a", encoding="utf-8") as f:
             part.write_csv(f, include_header=new_file)
