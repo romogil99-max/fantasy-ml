@@ -5,7 +5,11 @@
 # Cada ejecución deja una línea en logs/weekly_predictions.log (OK, WARN o ERROR); la salida completa
 # de nbconvert y la copia ejecutada del notebook quedan en logs/runs/.
 #
+# Los domingos (hora de Guadalajara) también calcula la probabilidad de ganar el enfrentamiento de la
+# semana (python -m fantasy_ml.matchup --log → data/predictions_log/winprob_<temporada>.csv).
+#
 # DRY_RUN=1: escribe el registro en una carpeta temporal y prueba el push sin enviar nada.
+# FORCE_MATCHUP=1: calcula la probabilidad de ganar aunque no sea domingo (para probar).
 set -Eeuo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -49,7 +53,7 @@ SUMMARY="$(FANTASY_ML_PREDICTIONS_LOG="$PRED_LOG_DIR" "$VENV/bin/python" - <<'EO
 import glob, os
 import polars as pl
 from fantasy_ml import predictions_log as plog
-files = sorted(glob.glob(os.path.join(os.environ["FANTASY_ML_PREDICTIONS_LOG"], "*.csv")))
+files = sorted(glob.glob(os.path.join(os.environ["FANTASY_ML_PREDICTIONS_LOG"], "[0-9]*.csv")))
 if not files:
     print("none")
 else:
@@ -66,6 +70,16 @@ fi
 read -r SEASON WEEK ROWS VERSION <<<"$SUMMARY"
 [[ "$VERSION" == *-dirty ]] && log WARN "el código tiene cambios sin commit: el registro queda con versión $VERSION"
 
+MATCHUP_MSG=""
+if [[ "$(TZ=America/Mexico_City date +%u)" == "7" || "${FORCE_MATCHUP:-0}" == "1" ]]; then
+    STEP="probabilidad de ganar"
+    FANTASY_ML_PREDICTIONS_LOG="$PRED_LOG_DIR" "$VENV/bin/python" -m fantasy_ml.matchup --log \
+        >"$RUN_DIR/$STAMP.matchup.txt" 2>>"$RUN_DIR/$STAMP.log"
+    MATCHUP_OUT="$(sed -n 1p "$RUN_DIR/$STAMP.matchup.txt")"
+    MATCHUP_MSG="$MATCHUP_OUT"
+    log OK "probabilidad de ganar: $MATCHUP_OUT"
+fi
+
 STEP="commit y push"
 if [[ "$DRY_RUN" == "1" ]]; then
     git push --dry-run -q origin main
@@ -79,8 +93,10 @@ if [[ -z "$(git status --porcelain -- data/predictions_log)" ]]; then
 fi
 LOCAL_TIME="$(TZ=America/Mexico_City date '+%Y-%m-%d %H:%M %Z')"
 git add data/predictions_log/*.csv
-git commit -q -m "Log $SEASON week $WEEK predictions (automatic run, $LOCAL_TIME)" \
-           -m "$ROWS pre-game predictions generated with code version $VERSION." -- data/predictions_log/
+BODY="$ROWS pre-game predictions generated with code version $VERSION."
+[[ -n "$MATCHUP_MSG" ]] && BODY="$BODY
+Win probability: $MATCHUP_MSG"
+git commit -q -m "Log $SEASON week $WEEK predictions (automatic run, $LOCAL_TIME)" -m "$BODY" -- data/predictions_log/
 git push -q origin main
 
 # Las copias ejecutadas del notebook se conservan 60 días
