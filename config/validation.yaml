@@ -1,0 +1,22 @@
+# Esquema de validación compartido por los notebooks 03 (baseline) y 04 (modelo).
+# Walk-forward por temporada: se entrena solo con temporadas anteriores a la que se valida.
+# Solo temporada regular (season_type == REG).
+
+folds:
+  - name: fold_2024
+    train: [2023]
+    valid: 2024
+  - name: fold_2025
+    train: [2023, 2024]
+    valid: 2025
+
+# 2026: temporada en curso. La liga se creó en 2026, así que es la única temporada
+# con proyecciones de ESPN; se usa como holdout para comparar el modelo contra ESPN.
+# El modelo final se entrena con 2023-2025.
+holdout:
+  season: 2026
+  train: [2023, 2024, 2025]
+  compare_against: espn_projections
+
+# Baseline para 2023-2025 (sin proyecciones de ESPN): media móvil de puntos del jugador.
+baseline: rolling_mean
