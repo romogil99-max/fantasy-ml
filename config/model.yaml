@@ -1,0 +1,334 @@
+# Generado por notebooks/03_backtest.ipynb (RETUNE=True). Hiperparámetros congelados:
+# elegidos solo con el walk-forward de la temporada `tuned_on` y usados sin cambios después.
+tuned_on: 2024
+criterion: MAE en jugadores relevantes, walk-forward semanal de la temporada de ajuste
+fixed_params:
+  objective: regression
+  subsample: 0.8
+  subsample_freq: 1
+  colsample_bytree: 0.8
+  reg_lambda: 1.0
+  random_state: 0
+  n_jobs: 4
+  verbose: -1
+grid:
+  num_leaves:
+  - 7
+  - 15
+  - 31
+  min_child_samples:
+  - 20
+  - 80
+  n_estimators:
+  - 200
+  - 500
+  learning_rate:
+  - 0.03
+params:
+  offense:
+    num_leaves: 7
+    min_child_samples: 80
+    n_estimators: 200
+    learning_rate: 0.03
+  k:
+    num_leaves: 7
+    min_child_samples: 80
+    n_estimators: 200
+    learning_rate: 0.03
+  dst:
+    num_leaves: 7
+    min_child_samples: 20
+    n_estimators: 200
+    learning_rate: 0.03
+search_results:
+  offense:
+  - num_leaves: 7
+    min_child_samples: 80
+    n_estimators: 200
+    learning_rate: 0.03
+    mae_relevant: 5.833
+    mae_all: 4.1309
+    mae_baseline_relevant: 6.2879
+    seconds: 10.5
+  - num_leaves: 7
+    min_child_samples: 20
+    n_estimators: 200
+    learning_rate: 0.03
+    mae_relevant: 5.8336
+    mae_all: 4.1436
+    mae_baseline_relevant: 6.2879
+    seconds: 9.1
+  - num_leaves: 15
+    min_child_samples: 80
+    n_estimators: 200
+    learning_rate: 0.03
+    mae_relevant: 5.8426
+    mae_all: 4.1258
+    mae_baseline_relevant: 6.2879
+    seconds: 25.4
+  - num_leaves: 15
+    min_child_samples: 20
+    n_estimators: 200
+    learning_rate: 0.03
+    mae_relevant: 5.8517
+    mae_all: 4.1375
+    mae_baseline_relevant: 6.2879
+    seconds: 32.4
+  - num_leaves: 31
+    min_child_samples: 80
+    n_estimators: 200
+    learning_rate: 0.03
+    mae_relevant: 5.8621
+    mae_all: 4.1295
+    mae_baseline_relevant: 6.2879
+    seconds: 45.0
+  - num_leaves: 7
+    min_child_samples: 20
+    n_estimators: 500
+    learning_rate: 0.03
+    mae_relevant: 5.8791
+    mae_all: 4.136
+    mae_baseline_relevant: 6.2879
+    seconds: 19.9
+  - num_leaves: 7
+    min_child_samples: 80
+    n_estimators: 500
+    learning_rate: 0.03
+    mae_relevant: 5.8812
+    mae_all: 4.1267
+    mae_baseline_relevant: 6.2879
+    seconds: 20.9
+  - num_leaves: 31
+    min_child_samples: 20
+    n_estimators: 200
+    learning_rate: 0.03
+    mae_relevant: 5.8907
+    mae_all: 4.1471
+    mae_baseline_relevant: 6.2879
+    seconds: 43.7
+  - num_leaves: 15
+    min_child_samples: 80
+    n_estimators: 500
+    learning_rate: 0.03
+    mae_relevant: 5.9181
+    mae_all: 4.1429
+    mae_baseline_relevant: 6.2879
+    seconds: 45.6
+  - num_leaves: 15
+    min_child_samples: 20
+    n_estimators: 500
+    learning_rate: 0.03
+    mae_relevant: 5.9427
+    mae_all: 4.1573
+    mae_baseline_relevant: 6.2879
+    seconds: 51.9
+  - num_leaves: 31
+    min_child_samples: 80
+    n_estimators: 500
+    learning_rate: 0.03
+    mae_relevant: 5.9561
+    mae_all: 4.1718
+    mae_baseline_relevant: 6.2879
+    seconds: 96.8
+  - num_leaves: 31
+    min_child_samples: 20
+    n_estimators: 500
+    learning_rate: 0.03
+    mae_relevant: 5.9913
+    mae_all: 4.1829
+    mae_baseline_relevant: 6.2879
+    seconds: 90.5
+  k:
+  - num_leaves: 7
+    min_child_samples: 80
+    n_estimators: 200
+    learning_rate: 0.03
+    mae_relevant: 3.8421
+    mae_all: 3.8821
+    mae_baseline_relevant: 4.211
+    seconds: 3.1
+  - num_leaves: 15
+    min_child_samples: 80
+    n_estimators: 200
+    learning_rate: 0.03
+    mae_relevant: 3.8424
+    mae_all: 3.8803
+    mae_baseline_relevant: 4.211
+    seconds: 2.3
+  - num_leaves: 31
+    min_child_samples: 80
+    n_estimators: 200
+    learning_rate: 0.03
+    mae_relevant: 3.8424
+    mae_all: 3.8803
+    mae_baseline_relevant: 4.211
+    seconds: 2.4
+  - num_leaves: 7
+    min_child_samples: 20
+    n_estimators: 200
+    learning_rate: 0.03
+    mae_relevant: 3.8807
+    mae_all: 3.9563
+    mae_baseline_relevant: 4.211
+    seconds: 3.1
+  - num_leaves: 7
+    min_child_samples: 80
+    n_estimators: 500
+    learning_rate: 0.03
+    mae_relevant: 3.928
+    mae_all: 3.9692
+    mae_baseline_relevant: 4.211
+    seconds: 4.2
+  - num_leaves: 15
+    min_child_samples: 80
+    n_estimators: 500
+    learning_rate: 0.03
+    mae_relevant: 3.9374
+    mae_all: 3.9676
+    mae_baseline_relevant: 4.211
+    seconds: 3.8
+  - num_leaves: 31
+    min_child_samples: 80
+    n_estimators: 500
+    learning_rate: 0.03
+    mae_relevant: 3.9374
+    mae_all: 3.9676
+    mae_baseline_relevant: 4.211
+    seconds: 5.3
+  - num_leaves: 15
+    min_child_samples: 20
+    n_estimators: 200
+    learning_rate: 0.03
+    mae_relevant: 3.9593
+    mae_all: 4.0183
+    mae_baseline_relevant: 4.211
+    seconds: 2.9
+  - num_leaves: 31
+    min_child_samples: 20
+    n_estimators: 200
+    learning_rate: 0.03
+    mae_relevant: 3.9641
+    mae_all: 4.0336
+    mae_baseline_relevant: 4.211
+    seconds: 5.0
+  - num_leaves: 7
+    min_child_samples: 20
+    n_estimators: 500
+    learning_rate: 0.03
+    mae_relevant: 4.0038
+    mae_all: 4.0781
+    mae_baseline_relevant: 4.211
+    seconds: 5.0
+  - num_leaves: 31
+    min_child_samples: 20
+    n_estimators: 500
+    learning_rate: 0.03
+    mae_relevant: 4.0869
+    mae_all: 4.1563
+    mae_baseline_relevant: 4.211
+    seconds: 13.3
+  - num_leaves: 15
+    min_child_samples: 20
+    n_estimators: 500
+    learning_rate: 0.03
+    mae_relevant: 4.0903
+    mae_all: 4.1454
+    mae_baseline_relevant: 4.211
+    seconds: 10.9
+  dst:
+  - num_leaves: 7
+    min_child_samples: 20
+    n_estimators: 200
+    learning_rate: 0.03
+    mae_relevant: 4.757
+    mae_all: 4.8954
+    mae_baseline_relevant: 5.5456
+    seconds: 3.1
+  - num_leaves: 7
+    min_child_samples: 80
+    n_estimators: 200
+    learning_rate: 0.03
+    mae_relevant: 4.7978
+    mae_all: 4.8633
+    mae_baseline_relevant: 5.5456
+    seconds: 3.0
+  - num_leaves: 15
+    min_child_samples: 80
+    n_estimators: 200
+    learning_rate: 0.03
+    mae_relevant: 4.8024
+    mae_all: 4.8662
+    mae_baseline_relevant: 5.5456
+    seconds: 3.4
+  - num_leaves: 31
+    min_child_samples: 80
+    n_estimators: 200
+    learning_rate: 0.03
+    mae_relevant: 4.8024
+    mae_all: 4.8662
+    mae_baseline_relevant: 5.5456
+    seconds: 2.3
+  - num_leaves: 7
+    min_child_samples: 20
+    n_estimators: 500
+    learning_rate: 0.03
+    mae_relevant: 4.8783
+    mae_all: 5.024
+    mae_baseline_relevant: 5.5456
+    seconds: 7.7
+  - num_leaves: 15
+    min_child_samples: 20
+    n_estimators: 200
+    learning_rate: 0.03
+    mae_relevant: 4.8931
+    mae_all: 4.9943
+    mae_baseline_relevant: 5.5456
+    seconds: 6.0
+  - num_leaves: 31
+    min_child_samples: 20
+    n_estimators: 200
+    learning_rate: 0.03
+    mae_relevant: 4.9214
+    mae_all: 5.0174
+    mae_baseline_relevant: 5.5456
+    seconds: 10.8
+  - num_leaves: 7
+    min_child_samples: 80
+    n_estimators: 500
+    learning_rate: 0.03
+    mae_relevant: 4.9713
+    mae_all: 5.0241
+    mae_baseline_relevant: 5.5456
+    seconds: 5.3
+  - num_leaves: 15
+    min_child_samples: 80
+    n_estimators: 500
+    learning_rate: 0.03
+    mae_relevant: 4.9731
+    mae_all: 5.0287
+    mae_baseline_relevant: 5.5456
+    seconds: 5.5
+  - num_leaves: 31
+    min_child_samples: 80
+    n_estimators: 500
+    learning_rate: 0.03
+    mae_relevant: 4.9731
+    mae_all: 5.0287
+    mae_baseline_relevant: 5.5456
+    seconds: 5.2
+  - num_leaves: 31
+    min_child_samples: 20
+    n_estimators: 500
+    learning_rate: 0.03
+    mae_relevant: 5.0218
+    mae_all: 5.11
+    mae_baseline_relevant: 5.5456
+    seconds: 17.6
+  - num_leaves: 15
+    min_child_samples: 20
+    n_estimators: 500
+    learning_rate: 0.03
+    mae_relevant: 5.0533
+    mae_all: 5.1179
+    mae_baseline_relevant: 5.5456
+    seconds: 12.0
