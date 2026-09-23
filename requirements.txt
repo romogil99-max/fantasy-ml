@@ -1,0 +1,8 @@
+nflreadpy==0.1.5
+espn-api==0.46.0
+polars
+pandas
+python-dotenv
+jupyter
+pyyaml
+nbstripout

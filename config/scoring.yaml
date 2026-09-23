@@ -1,0 +1,83 @@
+# Reglas de puntuación de la liga (ESPN, PPR completo, scoring estándar).
+# Fuente: pantalla "Scoring" de la configuración de la liga, temporada 2026.
+# notebooks/01_datos.ipynb compara este archivo con la configuración real de la liga
+# y falla si difieren: si la liga cambia sus reglas, actualiza este archivo.
+#
+# stat_id = ID de la regla en la API de ESPN (espn_api.football.constant.SETTINGS_SCORING_FORMAT_MAP).
+# ESPN no muestra reglas que valen 0; las que se añaden aquí con 0 están marcadas como "implícita".
+
+league_season: 2026
+format: PPR
+target_offense: fantasy_points_ppr   # columna de nflverse usada como objetivo para QB/RB/WR/TE
+
+# Jugadores individuales (QB/RB/WR/TE). Incluye la sección "Miscellaneous" de ESPN.
+offense:
+  passing:
+    - {stat_id: 3,   abbr: PY,   label: Passing Yards,            points: 0.04}
+    - {stat_id: 4,   abbr: PTD,  label: TD Pass,                  points: 4}
+    - {stat_id: 20,  abbr: INTT, label: Interceptions Thrown,     points: -2}  # ESPN lo muestra como "INT"
+    - {stat_id: 19,  abbr: 2PC,  label: 2pt Passing Conversion,   points: 2}
+  rushing:
+    - {stat_id: 24,  abbr: RY,   label: Rushing Yards,            points: 0.1}
+    - {stat_id: 25,  abbr: RTD,  label: TD Rush,                  points: 6}
+    - {stat_id: 26,  abbr: 2PR,  label: 2pt Rushing Conversion,   points: 2}
+  receiving:
+    - {stat_id: 42,  abbr: REY,  label: Receiving Yards,          points: 0.1}
+    - {stat_id: 53,  abbr: REC,  label: Each reception,           points: 1}
+    - {stat_id: 43,  abbr: RETD, label: TD Reception,             points: 6}
+    - {stat_id: 44,  abbr: 2PRE, label: 2pt Receiving Conversion, points: 2}
+  misc:
+    - {stat_id: 101, abbr: KRTD,    label: Kickoff Return TD,                points: 6}
+    - {stat_id: 102, abbr: PRTD,    label: Punt Return TD,                   points: 6}
+    - {stat_id: 63,  abbr: FTD,     label: Fumble Recovered for TD,          points: 6}
+    - {stat_id: 72,  abbr: FUML,    label: Total Fumbles Lost,               points: -2}
+    - {stat_id: 103, abbr: INTTD,   label: Interception Return TD,           points: 6}
+    - {stat_id: 104, abbr: FRTD,    label: Fumble Return TD,                 points: 6}
+    - {stat_id: 93,  abbr: BLKKRTD, label: Blocked Punt or FG return for TD, points: 6}
+    - {stat_id: 206, abbr: 2PTRET,  label: 2pt Return,                       points: 2}  # espn-api: "2PRET"
+    - {stat_id: 209, abbr: 1PSF,    label: 1pt Safety,                       points: 1}
+
+kicking:
+  - {stat_id: 86,  abbr: PAT,  label: Each PAT Made,         points: 1}
+  - {stat_id: 85,  abbr: FGM,  label: Total FG Missed,       points: -1}
+  - {stat_id: 80,  abbr: FG0,  label: FG Made (0-39 yards),  points: 3}
+  - {stat_id: 77,  abbr: FG40, label: FG Made (40-49 yards), points: 4}
+  - {stat_id: 198, abbr: FG50, label: FG Made (50-59 yards), points: 5}
+  - {stat_id: 201, abbr: FG60, label: FG Made (60+ yards),   points: 6}
+  # PAT fallado no resta (la liga no tiene la regla PATM).
+
+dst:
+  events:
+    - {stat_id: 101, abbr: KRTD,    label: Kickoff Return TD,                points: 6}
+    - {stat_id: 102, abbr: PRTD,    label: Punt Return TD,                   points: 6}
+    - {stat_id: 103, abbr: INTTD,   label: Interception Return TD,           points: 6}
+    - {stat_id: 104, abbr: FRTD,    label: Fumble Return TD,                 points: 6}
+    - {stat_id: 93,  abbr: BLKKRTD, label: Blocked Punt or FG return for TD, points: 6}
+    - {stat_id: 206, abbr: 2PTRET,  label: 2pt Return,                       points: 2}
+    - {stat_id: 209, abbr: 1PSF,    label: 1pt Safety,                       points: 1}
+    - {stat_id: 99,  abbr: SK,      label: Each Sack,                        points: 1}
+    - {stat_id: 97,  abbr: BLKK,    label: "Blocked Punt, PAT or FG",        points: 2}
+    - {stat_id: 95,  abbr: INT,     label: Each Interception,                points: 2}
+    - {stat_id: 96,  abbr: FR,      label: Each Fumble Recovered,            points: 2}
+    - {stat_id: 98,  abbr: SF,      label: Each Safety,                      points: 2}
+  # Rangos inclusivos; max: null = sin límite superior.
+  points_allowed:
+    - {stat_id: 89,  abbr: PA0,  min: 0,  max: 0,    points: 5}
+    - {stat_id: 90,  abbr: PA1,  min: 1,  max: 6,    points: 4}
+    - {stat_id: 91,  abbr: PA7,  min: 7,  max: 13,   points: 3}
+    - {stat_id: 92,  abbr: PA14, min: 14, max: 17,   points: 1}
+    - {stat_id: 121, abbr: PA18, min: 18, max: 21,   points: 0}  # implícita
+    - {stat_id: 122, abbr: PA22, min: 22, max: 27,   points: 0}  # implícita
+    - {stat_id: 123, abbr: PA28, min: 28, max: 34,   points: -1}
+    - {stat_id: 124, abbr: PA35, min: 35, max: 45,   points: -3}
+    - {stat_id: 125, abbr: PA46, min: 46, max: null, points: -5}
+  yards_allowed:
+    - {stat_id: 128, abbr: YA100, min: 0,   max: 99,   points: 5}
+    - {stat_id: 129, abbr: YA199, min: 100, max: 199,  points: 3}
+    - {stat_id: 130, abbr: YA299, min: 200, max: 299,  points: 2}
+    - {stat_id: 131, abbr: YA349, min: 300, max: 349,  points: 0}  # implícita
+    - {stat_id: 132, abbr: YA399, min: 350, max: 399,  points: -1}
+    - {stat_id: 133, abbr: YA449, min: 400, max: 449,  points: -3}
+    - {stat_id: 134, abbr: YA499, min: 450, max: 499,  points: -5}
+    - {stat_id: 135, abbr: YA549, min: 500, max: 549,  points: -6}
+    - {stat_id: 136, abbr: YA550, min: 550, max: null, points: -7}

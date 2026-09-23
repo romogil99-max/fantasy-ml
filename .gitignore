@@ -1,0 +1,14 @@
+# Credenciales
+.env
+.env.*
+!.env.example
+
+# Datos descargados (se regeneran con los notebooks)
+data/
+
+# Python / Jupyter
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+venv/
+.venv/
