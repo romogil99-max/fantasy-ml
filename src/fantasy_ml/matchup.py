@@ -195,7 +195,9 @@ def close_decisions(me_team: pl.DataFrame, rival_team: pl.DataFrame, sims: dict,
     - `conviene_hoy`: la opción con más P(ganar) esta semana (Monte Carlo, mismos sorteos para ambas).
       Combina media y varianza con mi situación real (favorito o no, y por cuánto).
     - `decide`: si la elección de hoy la marcó la media (el elegido tiene más puntos esperados) o la
-      varianza (tiene menos puntos esperados pero una dispersión que conviene).
+      varianza (tiene menos puntos esperados pero la dispersión que conviene según la regla). Si la
+      diferencia de P(ganar) es menor que 2 errores de Monte Carlo (diferencia pareada), no hay
+      preferencia real: se mantiene el titular.
     `desv_*`: desviación estándar de los puntos simulados de cada jugador (incluye la probabilidad de no jugar).
     """
     base = win_probability(me_team, rival_team, sims, slots, n_sims)
@@ -215,24 +217,34 @@ def close_decisions(me_team: pl.DataFrame, rival_team: pl.DataFrame, sims: dict,
                                                           .when(pl.col("espn_id") == s["espn_id"]).then(None)
                                                           .otherwise(pl.col("starter_slot")))
             alt = win_probability(swapped, rival_team, sims, slots, n_sims)
-            pick, other = (b, s) if alt["p_win"] > base["p_win"] else (s, b)
+            # diferencia pareada (mismos sorteos) y su error de Monte Carlo
+            win = lambda r: (r["_me"] > r["_rival"]) + 0.5 * (r["_me"] == r["_rival"])
+            d = win(alt) - win(base)
+            diff, se = float(d.mean()), float(d.std() / np.sqrt(n_sims))
             low, high = (s, b) if sd(s["espn_id"]) <= sd(b["espn_id"]) else (b, s)
-            if exp(pick) >= exp(other):
-                decide = "la media"
+            rule_pick = low if favorite else high
+            if abs(diff) < 2 * se:
+                pick, other, decide = s, b, "sin diferencia (ruido de la simulación): se mantiene el titular"
             else:
-                decide = "la varianza (" + ("favorito → menos" if favorite else "no favorito → más") + ")"
+                pick, other = (b, s) if diff > 0 else (s, b)
+                if exp(pick) >= exp(other):
+                    decide = "la media"
+                elif pick is rule_pick:
+                    decide = "la varianza (" + ("favorito → menos" if favorite else "no favorito → más") + ")"
+                else:
+                    decide = "otros factores (probabilidad de jugar, forma de la distribución)"
             rows.append({"slot": s["starter_slot"], "titular": s["name"], "alternativa": b["name"],
                          "esperado_titular": round(exp(s), 1), "esperado_alternativa": round(exp(b), 1),
                          "desv_titular": round(sd(s["espn_id"]), 1), "desv_alternativa": round(sd(b["espn_id"]), 1),
                          "si_favorito": low["name"], "si_no_favorito": high["name"],
                          "p_ganar_titular": round(base["p_win"], 3), "p_ganar_alternativa": round(alt["p_win"], 3),
-                         "conviene_hoy": pick["name"], "decide": decide})
+                         "error_mc_diferencia": round(se, 4), "conviene_hoy": pick["name"], "decide": decide})
     return pl.DataFrame(rows, schema={"slot": pl.Utf8, "titular": pl.Utf8, "alternativa": pl.Utf8,
                                       "esperado_titular": pl.Float64, "esperado_alternativa": pl.Float64,
                                       "desv_titular": pl.Float64, "desv_alternativa": pl.Float64,
                                       "si_favorito": pl.Utf8, "si_no_favorito": pl.Utf8,
                                       "p_ganar_titular": pl.Float64, "p_ganar_alternativa": pl.Float64,
-                                      "conviene_hoy": pl.Utf8, "decide": pl.Utf8})
+                                      "error_mc_diferencia": pl.Float64, "conviene_hoy": pl.Utf8, "decide": pl.Utf8})
 
 
 def range_consistency(players: pl.DataFrame, sims: dict) -> pl.DataFrame:
