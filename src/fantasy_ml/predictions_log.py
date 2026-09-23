@@ -29,12 +29,18 @@ def log_path(season: int):
 
 
 def code_version() -> str:
-    """Hash corto del commit actual; '-dirty' si hay cambios sin commit (sin contar el propio registro)."""
+    """Hash corto del commit actual; '-dirty' si hay cambios sin commit (sin contar el propio registro).
+
+    Compara contenido con `git diff`, que aplica el filtro de nbstripout. `git status` no sirve aquí:
+    marca como modificado un notebook ejecutado solo porque cambió de tamaño al tener resultados.
+    """
     def git(*args):
-        return subprocess.run(["git", "-C", str(ROOT), *args], capture_output=True, text=True).stdout.strip()
-    sha = git("rev-parse", "--short", "HEAD") or "unknown"
-    dirty = git("status", "--porcelain", "--", ".", ":!data/predictions_log")
-    return f"{sha}-dirty" if dirty else sha
+        return subprocess.run(["git", "-C", str(ROOT), *args], capture_output=True, text=True)
+    scope = ["--", ".", ":!data/predictions_log"]
+    sha = git("rev-parse", "--short", "HEAD").stdout.strip() or "unknown"
+    changed = git("diff", "--quiet", "--no-textconv", "HEAD", *scope).returncode != 0
+    untracked = git("ls-files", "--others", "--exclude-standard", *scope).stdout.strip()
+    return f"{sha}-dirty" if changed or untracked else sha
 
 
 def kickoff_utc(team_games: pl.DataFrame) -> pl.Expr:
