@@ -29,6 +29,7 @@ src/fantasy_ml/          # shared code used by every notebook
   trades.py              #   rest-of-season projections, availability model, trade values, Monte Carlo
   matchup.py             #   win probability against this week's opponent (also a CLI for the Sunday run)
   report.py              #   predictions log vs actual points (model and ESPN error)
+  outlook.py             #   multi-week outlook: weekly points, byes and holes, pickups, upcoming opponents
 app/dashboard.py         # Streamlit dashboard (probabilities, predictions, suggestions)
 scripts/run_weekly_predictions.sh  # weekly automated run: notebook 04, Sunday win probability, commit + push
 systemd/                 # user units: weekly predictions timer and dashboard service
@@ -123,18 +124,20 @@ The log is append-only and only records games that haven't started. It can be re
   - points are drawn from real out-of-sample residuals, scaled so each player's simulated P10–P90 matches his own range and centred on his prediction;
   - a starter who sits is replaced from the bench;
   - games already finished use actual points.
+- **Multi-week outlook** (`outlook.py`): for the next 4 weeks it shows expected points with 80% ranges, win probability against each scheduled opponent, the bye calendar with real holes (slots my roster cannot fill), and free agents ranked by their gain over the horizon, including who to drop. Here free agents only fill holes, because it describes my own roster; in trade valuation they compete for every slot.
 - **Close decisions:** for start/sit choices within 3 expected points, it shows the lower-variance option (right when favoured), the higher-variance option (right when not favoured) and the option with the higher win probability this week.
 - **Sunday run:** the automated run appends the result to `winprob_<season>.csv`, alongside ESPN's own win probability.
 
 ## Dashboard
 
-`app/dashboard.py` is a Streamlit app with one page and five tabs:
+`app/dashboard.py` is a Streamlit app with one page and six tabs:
 
 | Tab | What it shows |
 |---|---|
 | This week | Win probability with my current lineup, the optimal lineup and ESPN's; expected points with 80% ranges; the logged win-probability history; the opponent's lineup with holes filled |
 | My lineup | Each player's prediction, P10–P90 range, ESPN projection, injury status and whether he starts in the optimal lineup, plus close start/sit decisions |
 | Free agents | Top 5 per position, ranked by how much each one improves my optimal lineup |
+| Upcoming weeks | Expected points per week with 80% ranges, win probability against each upcoming opponent, a bye calendar with real lineup holes, and free agents ranked by their gain over the horizon (2, 4 or 6 weeks) |
 | Trades | Latest trade-finder results, with a button to run it again (~6 min) |
 | How is the model doing? | 2026 error of the model vs ESPN by position, and real coverage of the P10–P90 ranges, from the predictions log |
 
@@ -190,7 +193,7 @@ The **trade finder** searches the other 9 rosters for 1-for-1 and 2-for-1 trades
   - [x] optimal lineup, start/sit changes flagged when inconclusive (< 3 points), top free agents by lineup gain
   - [x] calibrated P10–P90 ranges per player, logged before each game
   - [x] win probability against this week's opponent, with favourite/underdog picks for close decisions (automated on Sundays)
-  - [ ] multi-week analysis
+  - [x] multi-week outlook: weekly points with ranges, bye calendar and real lineup holes, free agents over the horizon, win probability against upcoming opponents
 - [x] **Dashboard**: Streamlit app with win probability, lineup, free agents, trades and model tracking
 - [x] **06_trades**
   - [x] (a) week-by-week rest-of-season projections and evaluation of a specific trade for both teams
