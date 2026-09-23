@@ -204,16 +204,82 @@ def player_play_rate(df: pl.DataFrame, history: pl.DataFrame, rates: pl.DataFram
         (pl.col("hist_played") + kappa * pl.col("prior_rate")) / (pl.col("hist_played") + pl.col("hist_missed") + kappa)))
 
 
-def play_probability(cal: LeagueCalendar, cfg: dict) -> pl.Expr:
-    """Probabilidad de jugar cada semana: estado de ESPN esta semana, IR las próximas `ir_weeks`, tasa histórica después."""
-    status_p = cfg["status_play_prob"]
-    wk, now = pl.col("week"), cal.current_week
-    on_ir = pl.col("injury_status").is_in(list(IR_STATUSES)) | (pl.col("lineup_slot") == "IR") | (pl.col("nfl_status") == "RES")
-    this_week = pl.col("injury_status").replace_strict(status_p, default=1.0, return_dtype=pl.Float64)
-    return (pl.when(pl.col("bye")).then(0.0)
-              .when(on_ir & (wk < now + cfg["ir_weeks"])).then(0.0)
-              .when(wk == now).then(this_week)
-              .otherwise(pl.col("play_rate")))
+AVAIL_STATES = ["P", "INA", "RES"]  # jugando, ausencia corta (inactivo), ausencia larga (reserva/IR)
+
+
+def absence_transitions(history: pl.DataFrame, seasons=None) -> np.ndarray:
+    """Matriz de transición semanal 3x3 entre jugando (P), inactivo (INA) y reserva/IR (RES).
+
+    Estimada con partidos consecutivos del mismo jugador en la misma temporada (sin contar los de rol).
+    INA suele ser una ausencia corta y RES una larga: por eso se separan.
+    """
+    h = history.filter(pl.col("outcome") != ROLE)
+    if seasons:
+        h = h.filter(pl.col("season").is_in(seasons))
+    h = (h.sort("player_id", "season", "week")
+          .with_columns(state=pl.when(pl.col("outcome") == PLAYED).then(pl.lit("P")).otherwise(pl.col("status")))
+          .with_columns(nxt=pl.col("state").shift(-1).over("player_id", "season"))
+          .filter(pl.col("nxt").is_not_null()))
+    T = np.zeros((3, 3))
+    for a, b, n in h.group_by("state", "nxt").len().rows():
+        T[AVAIL_STATES.index(a), AVAIL_STATES.index(b)] += n
+    return T / T.sum(axis=1, keepdims=True)
+
+
+def _stationary(T: np.ndarray) -> np.ndarray:
+    w, v = np.linalg.eig(T.T)
+    pi = np.real(v[:, np.argmin(np.abs(w - 1))])
+    return pi / pi.sum()
+
+
+def player_chain(T: np.ndarray, play_rate: float) -> np.ndarray:
+    """Cadena del jugador: se escalan las transiciones que salen de "jugando" para que la fracción de
+    semanas jugando a largo plazo sea su `play_rate` (duración de las ausencias: la del historial)."""
+    target = min(max(play_rate, 0.05), 0.999)
+    lo, hi = 0.0, 1.0 / max(T[0, 1] + T[0, 2], 1e-9)
+    for _ in range(50):
+        c = (lo + hi) / 2
+        Tc = T.copy()
+        Tc[0, 1:] = T[0, 1:] * c
+        Tc[0, 0] = 1 - Tc[0, 1:].sum()
+        if _stationary(Tc)[0] > target:
+            lo = c
+        else:
+            hi = c
+    return Tc
+
+
+def initial_state(injury_status, on_ir: bool, cfg: dict) -> np.ndarray:
+    """Distribución (P, INA, RES) en la semana actual según el estado de ESPN."""
+    if on_ir:
+        return np.array([0.0, 0.0, 1.0])
+    p = cfg["status_play_prob"].get(injury_status, 1.0) if isinstance(injury_status, str) else 1.0
+    return np.array([p, 1 - p, 0.0])
+
+
+def availability_paths(players: pl.DataFrame, cal: LeagueCalendar, cfg: dict, T: np.ndarray) -> pl.DataFrame:
+    """Probabilidad de jugar de cada jugador en cada semana restante (marginal exacta de su cadena).
+
+    Semana actual: estado de ESPN. IR: ausencia forzada `ir_weeks` semanas y después sigue desde RES.
+    El tiempo avanza también en los byes (la recuperación sigue), pero en bye no juega. D/ST: 1.
+    `players`: una fila por jugador con espn_id, position, play_rate, injury_status, lineup_slot, nfl_status.
+    """
+    weeks, now = cal.weeks, cal.current_week
+    rows = []
+    for r in players.to_dicts():
+        if r["position"] == "D/ST":
+            rows += [{"espn_id": r["espn_id"], "week": w, "p_avail": 1.0} for w in weeks]
+            continue
+        on_ir = (r["injury_status"] in IR_STATUSES) or (r["lineup_slot"] == "IR") or (r["nfl_status"] == "RES")
+        Ti = player_chain(T, r["play_rate"] if r["play_rate"] is not None else 1.0)
+        dist = initial_state(r["injury_status"], on_ir, cfg)
+        for k, w in enumerate(weeks):
+            if k > 0:
+                dist = dist @ Ti
+            if on_ir and w < now + cfg["ir_weeks"]:
+                dist = np.array([0.0, 0.0, 1.0])
+            rows.append({"espn_id": r["espn_id"], "week": w, "p_avail": float(dist[0])})
+    return pl.DataFrame(rows, schema={"espn_id": pl.Int64, "week": pl.Int32, "p_avail": pl.Float64})
 
 
 def add_play_rates(proj: pl.DataFrame, history: pl.DataFrame, rates: pl.DataFrame, kappa: float) -> pl.DataFrame:
@@ -369,24 +435,30 @@ def project_rest_of_season(state: dict, params: dict, cal: LeagueCalendar, cfg: 
     return proj
 
 
-def with_expected_points(proj: pl.DataFrame, rosters: pl.DataFrame, cal: LeagueCalendar, cfg: dict) -> pl.DataFrame:
+def with_expected_points(proj: pl.DataFrame, rosters: pl.DataFrame, cal: LeagueCalendar, cfg: dict,
+                         T: np.ndarray) -> pl.DataFrame:
     """Cruza la proyección (que ya trae `play_rate` por jugador) con un roster y añade puntos esperados.
 
     `rosters` puede ser el de la liga (league_rosters) o el de agentes libres (league_free_agents).
-
-    - exp_points: proyección del modelo x probabilidad de jugar (lo que se usa para valorar).
+    - p_play: probabilidad de jugar esa semana, marginal de la cadena de disponibilidad del jugador
+      (availability_paths; `T` = absence_transitions). 0 en bye.
+    - exp_points: proyección del modelo x p_play (lo que se usa para valorar).
     - espn_points: media por partido de ESPN si juega esa semana (lo que ve el otro manager).
-      Solo se ajusta por el estado de lesión conocido (OUT esta semana, IR), no por la tasa histórica.
+      Solo se ajusta por el estado de lesión conocido (OUT/doubtful esta semana, IR), no por el historial.
     """
     status_p = cfg["status_play_prob"]
     wk, now = pl.col("week"), cal.current_week
     df = rosters.join(proj.drop("position", "name"), on="espn_id", how="left").with_columns(bye=pl.col("bye").fill_null(True))
+    people = df.filter(pl.col("proj").is_not_null()).unique("espn_id").select(
+        "espn_id", "position", "play_rate", "injury_status", "lineup_slot", "nfl_status")
+    df = df.join(availability_paths(people, cal, cfg, T), on=["espn_id", "week"], how="left")
     on_ir = pl.col("injury_status").is_in(list(IR_STATUSES)) | (pl.col("lineup_slot") == "IR") | (pl.col("nfl_status") == "RES")
     known_out = (pl.when(pl.col("bye")).then(0.0)
                    .when(on_ir & (wk < now + cfg["ir_weeks"])).then(0.0)
                    .when(wk == now).then(pl.col("injury_status").replace_strict(status_p, default=1.0, return_dtype=pl.Float64))
                    .otherwise(1.0))
-    return (df.with_columns(p_play=play_probability(cal, cfg), p_espn=known_out)
+    return (df.with_columns(p_play=pl.when(pl.col("bye")).then(0.0).otherwise(pl.col("p_avail").fill_null(0.0)), p_espn=known_out)
+              .drop("p_avail")
               .with_columns(exp_points=pl.col("proj") * pl.col("p_play"),
                             espn_points=pl.col("espn_avg_proj") * pl.col("p_espn")))
 
@@ -536,3 +608,261 @@ def resolve_team(league_proj: pl.DataFrame, name: str) -> int:
     if hit.is_empty():
         raise ValueError(f"Equipo {name!r} no encontrado: {sorted(teams['fantasy_team'].to_list())}")
     return hit["fantasy_team_id"][0]
+
+
+# ================================================================ etapa (b): incertidumbre
+# ---------------------------------------------------------------- backtest de horizonte
+
+def truncate_sources(src: dict, season: int, week: int) -> dict:
+    """Los datos tal como se conocían antes de la semana `week` de `season` (para backtests).
+
+    Estadísticas: solo partidos anteriores. Calendario: se conservan los partidos de la temporada (se
+    conocen de antemano) pero sin marcador desde `week`; las temporadas posteriores se eliminan.
+    """
+    before = (pl.col("season") < season) | ((pl.col("season") == season) & (pl.col("week") < week))
+    cast = lambda df: df.with_columns(pl.col("season").cast(pl.Int32), pl.col("week").cast(pl.Int32)) \
+        if df.schema["season"] != pl.Int32 or df.schema["week"] != pl.Int32 else df
+    out = {k: v for k, v in src.items()}
+    for k in ("player_stats", "team_stats", "snap_counts", "opportunity"):
+        out[k] = cast(src[k]).filter(before)
+    sched = cast(src["schedules"]).filter(pl.col("season") <= season)
+    future = (pl.col("season") == season) & (pl.col("week") >= week)
+    out["schedules"] = sched.with_columns([pl.when(future).then(None).otherwise(pl.col(c)).alias(c)
+                                           for c in ("home_score", "away_score", "result", "total")])
+    return out
+
+
+def historical_calendar(season: int, week: int, playoff_weight: float) -> LeagueCalendar:
+    """Calendario con el formato de la liga (1-14 regular, 15-17 playoffs) para una temporada pasada."""
+    return LeagueCalendar(season=season, current_week=week, reg_weeks=list(range(1, 15)), playoff_weeks=[15, 16, 17],
+                          trade_deadline=datetime(season, 12, 1, tzinfo=timezone.utc), playoff_weight=playoff_weight)
+
+
+def horizon_backtest(src: dict, rosters_weekly: pl.DataFrame, scoring_cfg: dict, params: dict, cfg: dict,
+                     season: int, origins=(3, 6, 9, 12)) -> pl.DataFrame:
+    """Proyecta el resto de la temporada desde varias semanas de `season` y compara con lo que pasó.
+
+    En cada origen W se usa solo lo que se sabía antes de W (truncate_sources) y el mismo método que en
+    producción (features congeladas, líneas estimadas desde W+1). Devuelve una fila por jugador/equipo y
+    semana jugada con la proyección, el resultado real y el horizonte (semanas desde W).
+    """
+    base_full = F.offense_base(src["player_stats"], src["snap_counts"], src["opportunity"], src["playerids"])
+    actual = pl.concat([
+        base_full.select(*KEYS, entity_id="player_id", y="fantasy_points_ppr"),
+        scoring.k_points(src["player_stats"], scoring_cfg).select(*KEYS, entity_id="player_id", y="fantasy_points"),
+        scoring.dst_points(src["team_stats"], src["schedules"], scoring_cfg).select(*KEYS, entity_id="team", y="fantasy_points"),
+    ]).filter(pl.col("season") == season)
+    out = []
+    for w in origins:
+        cut = truncate_sources(src, season, w)
+        state = season_state(cut, rosters_weekly.filter(pl.col("season") == season), scoring_cfg, season, w)
+        proj = project_rest_of_season(state, params, historical_calendar(season, w, cfg["playoff_weight"]), cfg)
+        out.append(proj.filter(~pl.col("bye"))
+                       .join(actual, on=["season", "week", "entity_id"], how="inner")
+                       .with_columns(origin=pl.lit(w, pl.Int32), horizon=pl.col("week") - w,
+                                     resid=pl.col("y") - pl.col("proj")))
+    return pl.concat(out, how="diagonal_relaxed")
+
+
+# ---------------------------------------------------------------- parámetros de incertidumbre
+
+HORIZON_BUCKETS = [(0, 0), (1, 2), (3, 5), (6, 9), (10, 99)]
+N_PROJ_BUCKETS = 5
+
+
+def _horizon_bucket(k: int) -> int:
+    return next(i for i, (lo, hi) in enumerate(HORIZON_BUCKETS) if lo <= k <= hi)
+
+
+def persistent_share(horizon_bt: pl.DataFrame, min_weeks: int = 4) -> float:
+    """Fracción del error que es persistente por jugador (ANOVA de efectos aleatorios sobre los residuos).
+
+    Se agrupa por (origen, jugador): entre = varianza de las medias − ruido; dentro = varianza media.
+    """
+    g = (horizon_bt.group_by("origin", "entity_id")
+                   .agg(pl.col("resid").mean().alias("m"), pl.col("resid").var().alias("v"), pl.len().alias("n"))
+                   .filter(pl.col("n") >= min_weeks))
+    within = g["v"].mean()
+    between = max(g["m"].var() - (g["v"] / g["n"]).mean(), 0.0)
+    return float(between / (between + within))
+
+
+def uncertainty_params(horizon_bt: pl.DataFrame, transitions: np.ndarray) -> dict:
+    """Todo lo que necesita el Monte Carlo: errores del backtest de horizonte y la cadena de disponibilidad.
+
+    - residuos reales (y − proyección) por posición y quintil de proyección, para muestrear el error
+      conservando su asimetría (partidos explosivos) y que crezca con la proyección;
+    - rho: fracción persistente del error por posición;
+    - factor de horizonte: desviación del error a k semanas / desviación global;
+    - matriz de transición de disponibilidad (jugando / inactivo / reserva); piso de puntos por posición.
+    """
+    hb = horizon_bt.with_columns(hbucket=pl.col("horizon").map_elements(_horizon_bucket, return_dtype=pl.Int64))
+    sd_all = hb["resid"].std()
+    hfac = {int(b): float(s / sd_all) for b, s in hb.group_by("hbucket").agg(pl.col("resid").std()).rows()}
+    pools = {}
+    for (pos,), d in hb.partition_by("position", as_dict=True).items():
+        edges = np.quantile(d["proj"].to_numpy(), np.linspace(0, 1, N_PROJ_BUCKETS + 1)[1:-1])
+        b = np.searchsorted(edges, d["proj"].to_numpy())
+        res = d["resid"].to_numpy()
+        pools[pos] = {"edges": edges, "resid": [res[b == i] for i in range(N_PROJ_BUCKETS)],
+                      "rho": persistent_share(d), "floor": float(d["y"].min())}
+    return {"pools": pools, "horizon_factor": hfac, "transitions": transitions}
+
+
+# ---------------------------------------------------------------- simulación
+
+@dataclass
+class Simulation:
+    ids: np.ndarray          # espn_id de cada jugador simulado (P,)
+    weeks: list[int]         # semanas simuladas (W)
+    proj: np.ndarray         # proyección si juega (P, W); 0 en bye
+    avail: np.ndarray        # juega esa semana (S, P, W)
+    points: np.ndarray       # puntos si juega (S, P, W)
+
+    def index(self, espn_ids) -> np.ndarray:
+        pos = {e: i for i, e in enumerate(self.ids)}
+        return np.array([pos[e] for e in espn_ids if e in pos], dtype=int)
+
+
+def simulate(players: pl.DataFrame, cal: LeagueCalendar, cfg: dict, unc: dict, n_sims: int = 2000, seed: int = 0) -> Simulation:
+    """Simula disponibilidad y puntos de cada jugador en cada semana restante.
+
+    `players`: filas jugador-semana (liga + agentes libres) con espn_id, position, week, proj, bye,
+    play_rate, injury_status, lineup_slot, nfl_status.
+    Disponibilidad: la misma cadena de 3 estados (jugando, inactivo, reserva/IR) que availability_paths,
+    así que la disponibilidad media simulada coincide con p_play del cálculo determinista. Puntos: proyección + error muestreado de los residuos del backtest de horizonte
+    (por posición y quintil de proyección), con una parte persistente por jugador (rho) y escalado por
+    el horizonte. D/ST siempre juega.
+    """
+    rng = np.random.default_rng(seed)
+    weeks, now = cal.weeks, cal.current_week
+    p = players.filter(pl.col("proj").is_not_null()).unique(["espn_id", "week"])
+    ids = np.array(sorted(p["espn_id"].unique().to_list()))
+    P, W, S = len(ids), len(weeks), n_sims
+    grid = (pl.DataFrame({"espn_id": np.repeat(ids, W), "week": np.tile(np.array(weeks, dtype=np.int32), P)})
+              .join(p, on=["espn_id", "week"], how="left")
+              .with_columns(pl.col("bye").fill_null(True), pl.col("proj").fill_null(0.0)))
+    proj = grid["proj"].to_numpy().reshape(P, W)
+    bye = grid["bye"].to_numpy().reshape(P, W)
+    info = p.unique("espn_id").sort("espn_id")
+    pos = info["position"].to_list()
+    rate = info["play_rate"].fill_null(1.0).to_numpy()
+    on_ir = (info["injury_status"].is_in(list(IR_STATUSES)) | (info["lineup_slot"] == "IR") | (info["nfl_status"] == "RES")).fill_null(False).to_numpy()
+
+    # --- disponibilidad: misma cadena de 3 estados que availability_paths (P, INA, RES)
+    avail = np.zeros((S, P, W), dtype=bool)
+    status = info["injury_status"].to_list()
+    for i in range(P):
+        if pos[i] == "D/ST":
+            avail[:, i, :] = ~bye[i]
+            continue
+        Ti = player_chain(unc["transitions"], rate[i])
+        cum = np.cumsum(Ti, axis=1)
+        state = rng.choice(3, size=S, p=initial_state(status[i], bool(on_ir[i]), cfg))
+        for j, w in enumerate(weeks):
+            if j > 0:
+                state = (rng.random(S)[:, None] > cum[state][:, :2]).sum(axis=1)   # muestreo de la fila de cada estado
+            if on_ir[i] and w < now + cfg["ir_weeks"]:
+                state[:] = 2
+            avail[:, i, j] = (state == 0) & ~bye[i, j]
+
+    # --- puntos si juega
+    points = np.zeros((S, P, W), dtype=np.float32)
+    for i in range(P):
+        pool = unc["pools"].get(pos[i])
+        if pool is None:
+            continue
+        z = rng.standard_normal(S)                          # componente persistente del jugador
+        for j, w in enumerate(weeks):
+            if bye[i, j]:
+                continue
+            bkt = int(np.searchsorted(pool["edges"], proj[i, j]))
+            res = pool["resid"][bkt]
+            sigma = res.std()
+            f = unc["horizon_factor"].get(_horizon_bucket(w - now), 1.0)
+            e = rng.choice(res, size=S) - res.mean()   # centrado: el Monte Carlo mide incertidumbre, no recalibra
+            r = f * (np.sqrt(pool["rho"]) * sigma * z + np.sqrt(1 - pool["rho"]) * e)
+            points[:, i, j] = np.maximum(proj[i, j] + r, pool["floor"])
+    return Simulation(ids=ids, weeks=list(weeks), proj=proj, avail=avail, points=points)
+
+
+def _sim_lineup_points(sim: Simulation, roster: np.ndarray, fa: np.ndarray, positions: dict, slots: dict, j: int) -> np.ndarray:
+    """Puntos reales de la alineación en la semana j de cada simulación (S,).
+
+    Cada simulación elige titulares entre los que juegan esa semana, por PROYECCIÓN (no por resultado:
+    sin ver el futuro); los slots vacíos se llenan con agentes libres (que también pueden no jugar).
+    """
+    S = sim.avail.shape[0]
+    order_r = roster[np.argsort(-sim.proj[roster, j])]
+    order_f = fa[np.argsort(-sim.proj[fa, j])] if len(fa) else fa
+    cand = np.concatenate([order_r, order_f])
+    is_fa = np.concatenate([np.zeros(len(order_r), bool), np.ones(len(order_f), bool)])
+    cpos = np.array([positions[c] for c in cand])
+    av = sim.avail[:, cand, j]
+    pts = sim.points[:, cand, j]
+    used = np.zeros_like(av)
+    filled_total = np.zeros(S, dtype=np.float64)
+    slot_list = L.starting_slots(slots)
+    empty = np.ones((S, len(slot_list)), dtype=bool)
+    rows = np.arange(S)
+    for fa_pass in (False, True):
+        for k, slot in enumerate(slot_list):
+            allowed = L.FLEX_SLOTS.get(slot, {slot})
+            elig = np.isin(cpos, list(allowed)) & (is_fa == fa_pass)
+            ok = av & ~used & elig[None, :] & empty[:, k:k + 1]
+            has = ok.any(axis=1)
+            idx = ok.argmax(axis=1)
+            used[rows[has], idx[has]] = True
+            empty[has, k] = False
+            filled_total[has] += pts[rows[has], idx[has]]
+    return filled_total
+
+
+def sim_roster_value(sim: Simulation, roster_ids, fa_by_week: dict, positions: dict, slots: dict, cal: LeagueCalendar) -> np.ndarray:
+    """Valor ponderado (playoffs ×peso) del roster en cada simulación (S,)."""
+    roster = sim.index(roster_ids)
+    total = np.zeros(sim.avail.shape[0])
+    for j, w in enumerate(sim.weeks):
+        fa = sim.index([e for e in fa_by_week.get(w, []) if e not in set(roster_ids)])
+        total += cal.weight(w) * _sim_lineup_points(sim, roster, fa, positions, slots, j)
+    return total
+
+
+def fa_candidates(fa_proj: pl.DataFrame, per_position: int = 3) -> dict:
+    """Por semana: los `per_position` mejores agentes libres de cada posición (por puntos esperados)."""
+    top = (fa_proj.filter(~pl.col("bye"), pl.col("exp_points") > 0)
+                  .sort("exp_points", descending=True).group_by("week", "position").head(per_position))
+    return {w: g["espn_id"].to_list() for (w,), g in top.partition_by("week", as_dict=True).items()}
+
+
+def summarize(x: np.ndarray) -> dict:
+    """Media (con su error de Monte Carlo), percentiles 10/50/90 y probabilidad de que sea positivo."""
+    return {"media": float(x.mean()), "error_mc": float(x.std() / np.sqrt(len(x))), "p10": float(np.percentile(x, 10)),
+            "p50": float(np.percentile(x, 50)), "p90": float(np.percentile(x, 90)), "prob_gana": float((x > 0).mean())}
+
+
+def mc_evaluate_trade(sim: Simulation, league_proj: pl.DataFrame, fa_proj: pl.DataFrame, team_a: int, team_b: int,
+                      a_gives: list[int], b_gives: list[int], rules: dict, cal: LeagueCalendar, cfg: dict,
+                      return_draws: bool = False):
+    """Distribución del cambio de valor de cada equipo (mismos sorteos antes y después del trade).
+
+    El jugador que se suelta si sobra roster es el mismo que en la evaluación determinista.
+    """
+    positions = dict(zip(*pl.concat([league_proj, fa_proj], how="diagonal_relaxed")
+                           .unique("espn_id").select("espn_id", "position").to_dict(as_series=False).values()))
+    positions = {int(np.where(sim.ids == e)[0][0]): p for e, p in positions.items() if e in set(sim.ids)}
+    fa_by_week = fa_candidates(fa_proj)
+    rows, draws = [], {}
+    for me, other, gives, gets in ((team_a, team_b, a_gives, b_gives), (team_b, team_a, b_gives, a_gives)):
+        before, after, dropped, invalid = rosters_after_trade(league_proj, me, other, gives, gets, rules, cal, cfg,
+                                                              "exp_points", fa_proj)
+        v0 = sim_roster_value(sim, before["espn_id"].unique().to_list(), fa_by_week, positions, rules["slots"], cal)
+        v1 = sim_roster_value(sim, after["espn_id"].unique().to_list(), fa_by_week, positions, rules["slots"], cal)
+        d = v1 - v0
+        draws[me] = d
+        rows.append({"fantasy_team_id": me, "fantasy_team": before["fantasy_team"][0].strip(),
+                     **{k: round(v, 3 if k == "prob_gana" else 1) for k, v in summarize(d).items()},
+                     "valor_antes_p10": round(float(np.percentile(v0, 10)), 0), "valor_antes_p90": round(float(np.percentile(v0, 90)), 0),
+                     "valido": invalid is None})
+    out = pl.DataFrame(rows)
+    return (out, draws) if return_draws else out
