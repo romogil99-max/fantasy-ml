@@ -1,0 +1,13 @@
+[Unit]
+Description=fantasy-ml: dashboard (Streamlit) en el puerto 8501
+
+[Service]
+WorkingDirectory=%h/fantasy-ml
+# Sin autenticación: 0.0.0.0 lo hace visible a TODA la red local (celular incluido); con 127.0.0.1
+# solo se ve desde el propio LXC (o con un túnel SSH: ssh -L 8501:localhost:8501 ml@<ip-del-lxc>).
+ExecStart=%h/venv/bin/streamlit run app/dashboard.py --server.address 0.0.0.0 --server.port 8501 --server.headless true --browser.gatherUsageStats false
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

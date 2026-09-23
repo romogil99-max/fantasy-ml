@@ -1089,3 +1089,38 @@ def find_trades(league_proj: pl.DataFrame, fa_proj: pl.DataFrame, rules: dict, c
     if verbose:
         print(f"3) Monte Carlo y vista de ESPN de los {len(rows)} mejores ({time.time() - t0:.0f}s)")
     return {"screened": screened, "exact": exact, "both": both, "top": pl.DataFrame(rows)}
+
+
+# ================================================================ flujo completo (dashboard)
+
+def build_trade_context(season: int = 2026, n_sims: int = 2000, seed: int = 0, progress=None) -> dict:
+    """Todo lo que necesita el buscador de trades, con los mismos pasos que el notebook 06.
+
+    `progress(texto)`: callback opcional para informar del avance (por ejemplo, desde el dashboard).
+    """
+    from . import data, espn
+    say = progress or (lambda _: None)
+    cfg, params = data.load_config("trades"), data.load_config("model")["params"]
+    league = espn.connect(season)
+    cal, rules, me = league_calendar(league, cfg["playoff_weight"]), league_rules(league), espn.my_team_id()
+    say("Cargando datos y features…")
+    src = data.load_sources()
+    rw_all = pl.concat([data.load_rosters_weekly(s) for s in (*cfg["availability"]["seasons"], season)], how="diagonal_relaxed")
+    state = season_state(src, rw_all.filter(pl.col("season") == season), data.load_config("scoring"), season, cal.current_week)
+    say("Modelo de disponibilidad…")
+    history = availability_history(rw_all.filter((pl.col("season") < season) | (pl.col("week") < cal.current_week)),
+                                   state["base"], state["points_k"], state["team_games"])
+    rates = availability_rates(history, state["base"], cfg["availability"])
+    kappa, _ = shrinkage_strength(history, state["base"], rates, cfg["availability"])
+    TM = absence_transitions(history, seasons=cfg["availability"]["seasons"])
+    say("Proyectando el resto de la temporada…")
+    proj = add_play_rates(project_rest_of_season(state, params, cal, cfg), history, rates, kappa)
+    league_proj = with_expected_points(proj, league_rosters(league), cal, cfg, TM)
+    fa_proj = with_expected_points(proj, league_free_agents(league, cal.current_week), cal, cfg, TM).filter(pl.col("proj").is_not_null())
+    say("Simulando temporadas (Monte Carlo)…")
+    hb_path = data.DATA_PROC / "horizon_backtest_2025.parquet"
+    if not hb_path.exists():
+        horizon_backtest(src, data.load_rosters_weekly(2025), data.load_config("scoring"), params, cfg, season=2025).write_parquet(hb_path)
+    sim = simulate(pl.concat([league_proj, fa_proj], how="diagonal_relaxed"), cal, cfg,
+                   uncertainty_params(pl.read_parquet(hb_path), TM), n_sims=n_sims, seed=seed)
+    return {"cfg": cfg, "cal": cal, "rules": rules, "me": me, "league_proj": league_proj, "fa_proj": fa_proj, "sim": sim}
