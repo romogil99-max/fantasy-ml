@@ -468,8 +468,9 @@ def with_expected_points(proj: pl.DataFrame, rosters: pl.DataFrame, cal: LeagueC
 def _week_lineup_points(wk: pl.DataFrame, cand: pl.DataFrame | None, slots: dict, score: str) -> float:
     """Puntos esperados de la alineación óptima de una semana, con nivel de reemplazo.
 
-    1. Titulares: los mejores disponibles del roster; los slots vacíos (bye, OUT, IR) se rellenan con el
-       mejor agente libre de esa posición (lineup.optimal_lineup con `replacements`).
+    1. Titulares: los mejores disponibles entre el roster y los mejores agentes libres de cada posición
+       (lineup.optimal_lineup con `replacements`): un slot vacío por bye/OUT/IR, o un titular peor que el
+       mejor agente libre, lo ocupa ese agente libre.
     2. Un titular con probabilidad de jugar p < 1 aporta p·proyección + (1−p)·(mejor reemplazo): el
        mejor jugador de la banca o agente libre elegible para ese slot que no sea titular. Cada
        reemplazo se usa para un solo titular. Es la aproximación en valor esperado de "si no juega,
@@ -498,19 +499,37 @@ def _week_lineup_points(wk: pl.DataFrame, cand: pl.DataFrame | None, slots: dict
     return total
 
 
-def team_week_points(players: pl.DataFrame, slots: dict, score: str, repl: pl.DataFrame | None = None,
-                     per_position: int = 3) -> pl.DataFrame:
+def prepare_replacements(repl: pl.DataFrame, score: str = "exp_points", per_position: int = 3) -> dict:
+    """Candidatos de reemplazo por semana (los `per_position` mejores agentes libres de cada posición).
+
+    Precalcularlos una vez acelera mucho las valoraciones repetidas (buscador de trades).
+    """
+    df = repl.with_columns(available=~pl.col("bye") & pl.col(score).is_not_null() & (pl.col(score) > 0)).filter("available")
+    top = df.sort(score, descending=True).group_by("week", "position").head(per_position)
+    return {w: g for (w,), g in top.partition_by("week", as_dict=True).items()}
+
+
+def _week_candidates(repl, week: int, exclude: list, score: str, per_position: int):
+    if repl is None:
+        return None
+    if isinstance(repl, dict):
+        cand = repl.get(week)
+        return None if cand is None else cand.filter(~pl.col("espn_id").is_in(exclude))
+    cand = repl.filter(pl.col("week") == week, ~pl.col("espn_id").is_in(exclude)).with_columns(
+        available=~pl.col("bye") & pl.col(score).is_not_null() & (pl.col(score) > 0))
+    return cand.filter("available").sort(score, descending=True).group_by("position").head(per_position)
+
+
+def team_week_points(players: pl.DataFrame, slots: dict, score: str, repl=None, per_position: int = 3) -> pl.DataFrame:
     """Puntos esperados de la alineación óptima de un roster en cada semana (byes, lesiones, reemplazo).
 
-    `repl`: agentes libres (proyección semanal); se usan los `per_position` mejores de cada posición.
+    `repl`: agentes libres (proyección semanal, o el dict de prepare_replacements); se usan los
+    `per_position` mejores de cada posición.
     """
     rows = []
     avail = lambda df: df.with_columns(available=~pl.col("bye") & pl.col(score).is_not_null() & (pl.col(score) > 0))
     for (week,), wk in players.partition_by("week", as_dict=True).items():
-        cand = None
-        if repl is not None:
-            cand = avail(repl.filter(pl.col("week") == week, ~pl.col("espn_id").is_in(wk["espn_id"].to_list())))
-            cand = cand.filter("available").sort(score, descending=True).group_by("position").head(per_position)
+        cand = _week_candidates(repl, week, wk["espn_id"].to_list(), score, per_position)
         rows.append({"week": week, "points": _week_lineup_points(avail(wk), cand, slots, score)})
     return pl.DataFrame(rows, schema={"week": pl.Int32, "points": pl.Float64}).sort("week")
 
@@ -521,10 +540,7 @@ def weekly_lineups(players: pl.DataFrame, slots: dict, score: str, repl: pl.Data
     avail = lambda df: df.with_columns(available=~pl.col("bye") & pl.col(score).is_not_null() & (pl.col(score) > 0))
     out = []
     for (week,), wk in players.partition_by("week", as_dict=True).items():
-        cand = None
-        if repl is not None:
-            cand = avail(repl.filter(pl.col("week") == week, ~pl.col("espn_id").is_in(wk["espn_id"].to_list())))
-            cand = cand.filter("available").sort(score, descending=True).group_by("position").head(per_position)
+        cand = _week_candidates(repl, week, wk["espn_id"].to_list(), score, per_position)
         opt = L.optimal_lineup(avail(wk), slots, score, cand).with_row_index("orden")
         pool = wk if cand is None else pl.concat([wk, cand.select(wk.columns)], how="vertical_relaxed")
         out.append(opt.join(pool.select("espn_id", "name", "position", score, "p_play"), on="espn_id", how="left")
@@ -560,7 +576,8 @@ def roster_value(players: pl.DataFrame, slots: dict, cal: LeagueCalendar, score:
             "playoffs": wp.filter(pl.col("phase") == "playoffs")["points"].sum()}
 
 
-def _apply_roster_limits(players: pl.DataFrame, incoming: set, rules: dict, cfg: dict, cal, score, repl=None):
+def _apply_roster_limits(players: pl.DataFrame, incoming: set, rules: dict, cfg: dict, cal, score, repl=None,
+                         max_drop_candidates: int | None = None):
     """Si sobran jugadores activos, suelta al que menos valor aporta (nunca a uno recién recibido).
 
     Devuelve (roster, jugador soltado o None, motivo de invalidez o None).
@@ -569,7 +586,11 @@ def _apply_roster_limits(players: pl.DataFrame, incoming: set, rules: dict, cfg:
     dropped = None
     if active > cfg["max_active_roster"]:
         base_val = roster_value(players, rules["slots"], cal, score, repl)["value"]
-        candidates = players.filter(~pl.col("espn_id").is_in(list(incoming)), pl.col("lineup_slot") != "IR")["espn_id"].unique()
+        cands = (players.filter(~pl.col("espn_id").is_in(list(incoming)), pl.col("lineup_slot") != "IR")
+                        .group_by("espn_id").agg(pl.col(score).sum()).sort(score))
+        if max_drop_candidates:  # para acelerar: solo los de menos puntos esperados en el resto de la temporada
+            cands = cands.head(max_drop_candidates)
+        candidates = cands["espn_id"]
         losses = {pid: base_val - roster_value(players.filter(pl.col("espn_id") != pid), rules["slots"], cal, score, repl)["value"]
                   for pid in candidates}
         drop_id = min(losses, key=losses.get)
@@ -582,7 +603,8 @@ def _apply_roster_limits(players: pl.DataFrame, incoming: set, rules: dict, cfg:
 
 
 def rosters_after_trade(league_proj: pl.DataFrame, me: int, other: int, gives: list[int], gets: list[int],
-                        rules: dict, cal: LeagueCalendar, cfg: dict, score: str = "exp_points", repl=None):
+                        rules: dict, cal: LeagueCalendar, cfg: dict, score: str = "exp_points", repl=None,
+                        max_drop_candidates: int | None = None):
     """Roster de `me` antes y después de dar `gives` y recibir `gets` (espn_id), aplicando límites.
 
     Los jugadores recibidos entran a la banca (slot BE), así que cuentan para el límite de activos.
@@ -592,7 +614,7 @@ def rosters_after_trade(league_proj: pl.DataFrame, me: int, other: int, gives: l
     received = (league_proj.filter(pl.col("fantasy_team_id") == other, pl.col("espn_id").is_in(gets))
                            .with_columns(fantasy_team_id=pl.lit(me), lineup_slot=pl.lit("BE")))
     after = pl.concat([before.filter(~pl.col("espn_id").is_in(gives)), received], how="vertical_relaxed")
-    after, dropped, invalid = _apply_roster_limits(after, set(gets), rules, cfg, cal, score, repl)
+    after, dropped, invalid = _apply_roster_limits(after, set(gets), rules, cfg, cal, score, repl, max_drop_candidates)
     return before, after, dropped, invalid
 
 
@@ -828,32 +850,25 @@ def _sim_lineup_points(sim: Simulation, roster: np.ndarray, fa: np.ndarray, posi
     """Puntos reales de la alineación en la semana j de cada simulación (S,).
 
     Cada simulación elige titulares entre los que juegan esa semana, por PROYECCIÓN (no por resultado:
-    sin ver el futuro); los slots vacíos se llenan con agentes libres (que también pueden no jugar).
+    sin ver el futuro), entre el roster y los mejores agentes libres (misma regla que el determinista).
     """
     S = sim.avail.shape[0]
-    order_r = roster[np.argsort(-sim.proj[roster, j])]
-    order_f = fa[np.argsort(-sim.proj[fa, j])] if len(fa) else fa
-    cand = np.concatenate([order_r, order_f])
-    is_fa = np.concatenate([np.zeros(len(order_r), bool), np.ones(len(order_f), bool)])
+    cand = np.concatenate([roster, fa]) if len(fa) else roster
+    cand = cand[np.argsort(-sim.proj[cand, j], kind="stable")]
     cpos = np.array([positions[c] for c in cand])
     av = sim.avail[:, cand, j]
     pts = sim.points[:, cand, j]
     used = np.zeros_like(av)
-    filled_total = np.zeros(S, dtype=np.float64)
-    slot_list = L.starting_slots(slots)
-    empty = np.ones((S, len(slot_list)), dtype=bool)
+    total = np.zeros(S, dtype=np.float64)
     rows = np.arange(S)
-    for fa_pass in (False, True):
-        for k, slot in enumerate(slot_list):
-            allowed = L.FLEX_SLOTS.get(slot, {slot})
-            elig = np.isin(cpos, list(allowed)) & (is_fa == fa_pass)
-            ok = av & ~used & elig[None, :] & empty[:, k:k + 1]
-            has = ok.any(axis=1)
-            idx = ok.argmax(axis=1)
-            used[rows[has], idx[has]] = True
-            empty[has, k] = False
-            filled_total[has] += pts[rows[has], idx[has]]
-    return filled_total
+    for slot in L.starting_slots(slots):
+        elig = np.isin(cpos, list(L.FLEX_SLOTS.get(slot, {slot})))
+        ok = av & ~used & elig[None, :]
+        has = ok.any(axis=1)
+        idx = ok.argmax(axis=1)
+        used[rows[has], idx[has]] = True
+        total[has] += pts[rows[has], idx[has]]
+    return total
 
 
 def sim_roster_weekly(sim: Simulation, roster_ids, fa_by_week: dict, positions: dict, slots: dict) -> np.ndarray:
@@ -923,3 +938,154 @@ def mc_weekly_summary(draws_weekly: np.ndarray, sim: Simulation, cal: LeagueCale
         "media": draws_weekly.mean(axis=0).round(1), "p10": np.percentile(draws_weekly, 10, axis=0).round(1),
         "p90": np.percentile(draws_weekly, 90, axis=0).round(1), "prob_mejora": (draws_weekly > 0).mean(axis=0).round(2),
         "prob_empeora": (draws_weekly < 0).mean(axis=0).round(2)})
+
+
+# ================================================================ etapa (c): buscador de trades
+
+TRADE_POSITIONS = ("QB", "RB", "WR", "TE")  # K y D/ST casi nunca se intercambian
+
+
+def marginal_values(league_proj: pl.DataFrame, repl: dict, rules: dict, cal: LeagueCalendar, me: int,
+                    positions=TRADE_POSITIONS, score: str = "exp_points") -> dict:
+    """Valores marginales para filtrar trades rápido (aproximación aditiva, sin límites de roster).
+
+    - base[t]: valor del roster del equipo t.
+    - loss[t][x]: cuánto pierde t si cede a su jugador x.
+    - gain[t][y]: cuánto gana t si recibe a y (yo: jugadores de los otros equipos; ellos: los míos).
+    """
+    slots = rules["slots"]
+    teams = league_proj["fantasy_team_id"].unique().to_list()
+    roster = {t: league_proj.filter(pl.col("fantasy_team_id") == t) for t in teams}
+    val = lambda df: roster_value(df, slots, cal, score, repl)["value"]
+    tradable = lambda df: df.filter(pl.col("position").is_in(list(positions)))["espn_id"].unique().to_list()
+    base = {t: val(roster[t]) for t in teams}
+    loss = {t: {x: base[t] - val(roster[t].filter(pl.col("espn_id") != x)) for x in tradable(roster[t])} for t in teams}
+    gain = {}
+    for t in teams:
+        pool = tradable(league_proj.filter(pl.col("fantasy_team_id") != t)) if t == me else tradable(roster[me])
+        gain[t] = {}
+        for y in pool:
+            row = league_proj.filter(pl.col("espn_id") == y).with_columns(fantasy_team_id=pl.lit(t), lineup_slot=pl.lit("BE"))
+            gain[t][y] = val(pl.concat([roster[t], row], how="vertical_relaxed")) - base[t]
+    return {"base": base, "loss": loss, "gain": gain, "roster": roster}
+
+
+def screen_trades(mv: dict, league_proj: pl.DataFrame, me: int, margin: float = 5.0) -> pl.DataFrame:
+    """Todos los 1x1 y 2x1 (en las dos direcciones) con su valor aproximado para cada equipo.
+
+    Aproximación: lo que gano con lo que recibo − lo que pierdo con lo que doy, sumando jugador por
+    jugador, menos el jugador que habría que soltar si el roster queda lleno. Se quedan los que, así
+    estimados, benefician a los dos (con un margen de tolerancia).
+    """
+    active = {t: r.filter(pl.col("lineup_slot") != "IR")["espn_id"].n_unique() for t, r in mv["roster"].items()}
+    cap = 15
+
+    def drop_cost(t, gives, gets):
+        """Si el equipo queda con más activos que el máximo, pierde a su jugador menos valioso."""
+        if active[t] - len(gives) + len(gets) <= cap:
+            return 0.0
+        return min(v for x, v in mv["loss"][t].items() if x not in gives)
+
+    rows = []
+    for t in mv["base"]:
+        if t == me:
+            continue
+        mine, theirs = list(mv["loss"][me]), list(mv["loss"][t])
+        combos = [((a,), (b,)) for a in mine for b in theirs]                                   # 1x1
+        combos += [((a1, a2), (b,)) for i, a1 in enumerate(mine) for a2 in mine[i + 1:] for b in theirs]  # doy 2, recibo 1
+        combos += [((a,), (b1, b2)) for a in mine for i, b1 in enumerate(theirs) for b2 in theirs[i + 1:]]  # doy 1, recibo 2
+        for gives, gets in combos:
+            d_me = sum(mv["gain"][me][b] for b in gets) - sum(mv["loss"][me][a] for a in gives) - drop_cost(me, gives, gets)
+            d_them = sum(mv["gain"][t][a] for a in gives) - sum(mv["loss"][t][b] for b in gets) - drop_cost(t, gets, gives)
+            if d_me > 0 and d_them > -margin:
+                rows.append({"partner": t, "da": gives, "recibe": gets, "tipo": f"{len(gives)}x{len(gets)}",
+                             "aprox_yo": d_me, "aprox_ellos": d_them})
+    df = pl.DataFrame(rows, schema={"partner": pl.Int64, "da": pl.List(pl.Int64), "recibe": pl.List(pl.Int64),
+                                    "tipo": pl.Utf8, "aprox_yo": pl.Float64, "aprox_ellos": pl.Float64})
+    return df.with_columns(aprox_min=pl.min_horizontal("aprox_yo", "aprox_ellos")).sort("aprox_min", descending=True)
+
+
+def exact_trade_values(candidates: pl.DataFrame, mv: dict, league_proj: pl.DataFrame, repl: dict, rules: dict,
+                       cal: LeagueCalendar, cfg: dict, me: int, score: str = "exp_points",
+                       max_drop_candidates: int = 4) -> pl.DataFrame:
+    """Valor exacto (determinista, con límites de roster y nivel de reemplazo) para cada candidato."""
+    slots = rules["slots"]
+    out = []
+    for r in candidates.iter_rows(named=True):
+        res = {}
+        for team, other, gives, gets in ((me, r["partner"], r["da"], r["recibe"]), (r["partner"], me, r["recibe"], r["da"])):
+            _, after, dropped, invalid = rosters_after_trade(league_proj, team, other, gives, gets, rules, cal, cfg,
+                                                             score, repl, max_drop_candidates)
+            res[team] = (roster_value(after, slots, cal, score, repl)["value"] - mv["base"][team], dropped, invalid)
+        out.append({**r, "delta_yo": res[me][0], "delta_ellos": res[r["partner"]][0],
+                    "suelto_yo": res[me][1], "suelta_ellos": res[r["partner"]][1],
+                    "valido": res[me][2] is None and res[r["partner"]][2] is None})
+    return pl.DataFrame(out).with_columns(delta_min=pl.min_horizontal("delta_yo", "delta_ellos"))
+
+
+def drop_redundant(trades: pl.DataFrame, tol: float = 0.5) -> pl.DataFrame:
+    """Quita trades que no mejoran a uno más simple con el mismo equipo.
+
+    Un trade es redundante si existe otro con el mismo equipo, con jugadores que son un subconjunto de
+    los suyos (lo que doy ⊆ y lo que recibo ⊆) y cuyo beneficio mínimo es al menos igual (± `tol`).
+    Ejemplo: "Purdy por Metcalf + Shakir" cuando Shakir se suelta y "Purdy por Metcalf" vale lo mismo.
+    """
+    rows = trades.sort(pl.col("da").list.len() + pl.col("recibe").list.len(), "delta_min", descending=[False, True]).to_dicts()
+    kept = []
+    for r in rows:
+        simpler = any(k["partner"] == r["partner"] and set(k["da"]) <= set(r["da"]) and set(k["recibe"]) <= set(r["recibe"])
+                      and k["delta_min"] >= r["delta_min"] - tol for k in kept)
+        if not simpler:
+            kept.append(r)
+    return pl.DataFrame(kept, schema=trades.schema).sort("delta_min", descending=True)
+
+
+def find_trades(league_proj: pl.DataFrame, fa_proj: pl.DataFrame, rules: dict, cal: LeagueCalendar, cfg: dict,
+                me: int, sim: Simulation | None = None, max_exact: int = 800, top: int = 30,
+                margin: float = 5.0, verbose: bool = True) -> dict:
+    """Buscador de trades 1x1 y 2x1 en los que ganan los dos equipos.
+
+    1. Filtro con valores marginales (aproximación aditiva) → candidatos en que ganarían los dos.
+    2. Valor exacto de los `max_exact` mejores (por el beneficio del que menos gana); se quedan los que
+       son válidos y con Δ > 0 para ambos, sin los redundantes (drop_redundant).
+    3. Para los `top` mejores: Monte Carlo (media, intervalo 80%, prob. de ganar de cada equipo) y vista
+       de ESPN (¿el otro manager lo vería como una ganancia?).
+    """
+    import time
+    t0 = time.time()
+    repl = prepare_replacements(fa_proj)
+    mv = marginal_values(league_proj, repl, rules, cal, me)
+    screened = screen_trades(mv, league_proj, me, margin)
+    if verbose:
+        print(f"1) valores marginales ({time.time() - t0:.0f}s) · candidatos tras el filtro: {screened.height:,}")
+    exact = exact_trade_values(screened.head(max_exact), mv, league_proj, repl, rules, cal, cfg, me)
+    both_all = exact.filter("valido", pl.col("delta_yo") > 0, pl.col("delta_ellos") > 0)
+    both = drop_redundant(both_all)
+    if verbose:
+        print(f"2) valor exacto de {min(max_exact, screened.height)} ({time.time() - t0:.0f}s) · ganan los dos: {both_all.height} "
+              f"· sin redundantes: {both.height}")
+    best = both.head(top)
+    names = dict(league_proj.select("espn_id", "name").unique("espn_id").iter_rows())
+    teams = dict(league_proj.select("fantasy_team_id", "fantasy_team").unique().iter_rows())
+    rows = []
+    espn_repl = prepare_replacements(fa_proj, score="espn_points")
+    espn_base = {t: roster_value(mv["roster"][t], rules["slots"], cal, "espn_points", espn_repl)["value"]
+                 for t in set(best["partner"].to_list()) | {me}}
+    for r in best.iter_rows(named=True):
+        row = {"equipo": teams[r["partner"]].strip(), "tipo": r["tipo"],
+               "doy": ", ".join(names[x] for x in r["da"]), "recibo": ", ".join(names[x] for x in r["recibe"]),
+               "delta_yo": round(r["delta_yo"], 1), "delta_ellos": round(r["delta_ellos"], 1),
+               "suelto_yo": r["suelto_yo"], "suelta_ellos": r["suelta_ellos"]}
+        for team, other, gives, gets, key in ((me, r["partner"], r["da"], r["recibe"], "yo"),
+                                               (r["partner"], me, r["recibe"], r["da"], "ellos")):
+            _, after, _, _ = rosters_after_trade(league_proj, team, other, gives, gets, rules, cal, cfg, "espn_points", espn_repl, 4)
+            row[f"espn_{key}"] = round(roster_value(after, rules["slots"], cal, "espn_points", espn_repl)["value"] - espn_base[team], 1)
+        if sim is not None:
+            mc = mc_evaluate_trade(sim, league_proj, fa_proj, me, r["partner"], list(r["da"]), list(r["recibe"]), rules, cal, cfg)
+            m_me, m_th = mc.row(0, named=True), mc.row(1, named=True)
+            row |= {"mc_yo": round(m_me["media"], 1), "p10_yo": m_me["p10"], "p90_yo": m_me["p90"], "prob_gano": m_me["prob_gana"],
+                    "mc_ellos": round(m_th["media"], 1), "p10_ellos": m_th["p10"], "p90_ellos": m_th["p90"], "prob_ganan": m_th["prob_gana"]}
+        rows.append(row)
+    if verbose:
+        print(f"3) Monte Carlo y vista de ESPN de los {len(rows)} mejores ({time.time() - t0:.0f}s)")
+    return {"screened": screened, "exact": exact, "both": both, "top": pl.DataFrame(rows)}

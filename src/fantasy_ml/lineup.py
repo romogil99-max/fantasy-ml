@@ -27,28 +27,24 @@ def optimal_lineup(players: pl.DataFrame, slot_counts: dict, score: str,
     flexible acepta un superconjunto de las posiciones de los fijos.
     `players` necesita: espn_id, position, available (bool) y la columna `score`.
 
-    `replacements` (opcional, mismas columnas): agentes libres que SOLO rellenan los slots que quedan
-    vacíos (nadie del roster disponible para esa posición: bye, lesión). Columna `source`: roster/reemplazo.
+    `replacements` (opcional, mismas columnas): agentes libres que compiten por TODOS los slots con los
+    jugadores del roster (nivel de reemplazo: un manager no alinea a alguien peor que el mejor agente
+    libre disponible; lo ficharía). Así el valor de un roster nunca baja por tener un jugador más.
+    Columna `source`: roster/reemplazo.
     """
-    pool = (players.filter(pl.col("available"), pl.col(score).is_not_null())
-                   .sort(score, descending=True).to_dicts())
+    pool = players.filter(pl.col("available"), pl.col(score).is_not_null()).with_columns(source=pl.lit("roster"))
+    if replacements is not None:
+        pool = pl.concat([pool, replacements.filter(pl.col("available"), pl.col(score).is_not_null())
+                                            .select(pool.drop("source").columns).with_columns(source=pl.lit("reemplazo"))],
+                         how="vertical_relaxed")
+    pool = pool.sort(score, descending=True).to_dicts()
     used, rows = set(), []
     for slot in starting_slots(slot_counts):
         allowed = FLEX_SLOTS.get(slot, {slot})
         pick = next((p for p in pool if p["espn_id"] not in used and p["position"] in allowed), None)
         if pick:
             used.add(pick["espn_id"])
-        rows.append({"slot": slot, "espn_id": pick["espn_id"] if pick else None, "source": "roster" if pick else None})
-    if replacements is not None and any(r["espn_id"] is None for r in rows):
-        repl = (replacements.filter(pl.col("available"), pl.col(score).is_not_null(), ~pl.col("espn_id").is_in(list(used)))
-                            .sort(score, descending=True).to_dicts())
-        for r in rows:
-            if r["espn_id"] is None:
-                allowed = FLEX_SLOTS.get(r["slot"], {r["slot"]})
-                pick = next((p for p in repl if p["espn_id"] not in used and p["position"] in allowed), None)
-                if pick:
-                    used.add(pick["espn_id"])
-                    r["espn_id"], r["source"] = pick["espn_id"], "reemplazo"
+        rows.append({"slot": slot, "espn_id": pick["espn_id"] if pick else None, "source": pick["source"] if pick else None})
     return pl.DataFrame(rows, schema={"slot": pl.Utf8, "espn_id": pl.Int64, "source": pl.Utf8})
 
 
