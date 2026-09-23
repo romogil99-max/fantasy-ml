@@ -515,6 +515,44 @@ def team_week_points(players: pl.DataFrame, slots: dict, score: str, repl: pl.Da
     return pl.DataFrame(rows, schema={"week": pl.Int32, "points": pl.Float64}).sort("week")
 
 
+def weekly_lineups(players: pl.DataFrame, slots: dict, score: str, repl: pl.DataFrame | None = None,
+                   per_position: int = 3) -> pl.DataFrame:
+    """Alineación óptima de cada semana: slot, jugador, origen (roster/reemplazo) y puntos esperados."""
+    avail = lambda df: df.with_columns(available=~pl.col("bye") & pl.col(score).is_not_null() & (pl.col(score) > 0))
+    out = []
+    for (week,), wk in players.partition_by("week", as_dict=True).items():
+        cand = None
+        if repl is not None:
+            cand = avail(repl.filter(pl.col("week") == week, ~pl.col("espn_id").is_in(wk["espn_id"].to_list())))
+            cand = cand.filter("available").sort(score, descending=True).group_by("position").head(per_position)
+        opt = L.optimal_lineup(avail(wk), slots, score, cand).with_row_index("orden")
+        pool = wk if cand is None else pl.concat([wk, cand.select(wk.columns)], how="vertical_relaxed")
+        out.append(opt.join(pool.select("espn_id", "name", "position", score, "p_play"), on="espn_id", how="left")
+                      .with_columns(week=pl.lit(week, pl.Int32)))
+    return pl.concat(out).sort("week", "orden").drop("orden")
+
+
+def lineup_changes_by_week(before: pl.DataFrame, after: pl.DataFrame, score: str = "exp_points") -> pl.DataFrame:
+    """Qué titulares entran y salen cada semana (diferencia de conjuntos, sin importar el slot).
+
+    `before`/`after`: salidas de weekly_lineups. Solo lista semanas con algún cambio.
+    """
+    rows = []
+    for w in sorted(set(before["week"].to_list())):
+        b = before.filter(pl.col("week") == w)
+        a = after.filter(pl.col("week") == w)
+        tag = lambda r: r["name"] + (" (agente libre)" if r["source"] == "reemplazo" else "")
+        bs = {r["name"]: r for r in b.to_dicts() if r["name"]}
+        as_ = {r["name"]: r for r in a.to_dicts() if r["name"]}
+        out_, in_ = sorted(set(bs) - set(as_)), sorted(set(as_) - set(bs))
+        if out_ or in_:
+            rows.append({"week": w, "sale": ", ".join(tag(bs[n]) for n in out_), "entra": ", ".join(tag(as_[n]) for n in in_),
+                         "puntos_esperados_antes": round(b[score].fill_null(0).sum(), 1),
+                         "puntos_esperados_despues": round(a[score].fill_null(0).sum(), 1)})
+    return pl.DataFrame(rows, schema={"week": pl.Int32, "sale": pl.Utf8, "entra": pl.Utf8,
+                                      "puntos_esperados_antes": pl.Float64, "puntos_esperados_despues": pl.Float64})
+
+
 def roster_value(players: pl.DataFrame, slots: dict, cal: LeagueCalendar, score: str, repl: pl.DataFrame | None = None) -> dict:
     wp = team_week_points(players, slots, score, repl).join(cal.weights(), on="week")
     return {"value": (wp["points"] * wp["weight"]).sum(),
@@ -818,14 +856,20 @@ def _sim_lineup_points(sim: Simulation, roster: np.ndarray, fa: np.ndarray, posi
     return filled_total
 
 
-def sim_roster_value(sim: Simulation, roster_ids, fa_by_week: dict, positions: dict, slots: dict, cal: LeagueCalendar) -> np.ndarray:
-    """Valor ponderado (playoffs ×peso) del roster en cada simulación (S,)."""
+def sim_roster_weekly(sim: Simulation, roster_ids, fa_by_week: dict, positions: dict, slots: dict) -> np.ndarray:
+    """Puntos reales de la alineación en cada simulación y semana (S, W), sin ponderar."""
     roster = sim.index(roster_ids)
-    total = np.zeros(sim.avail.shape[0])
+    out = np.zeros((sim.avail.shape[0], len(sim.weeks)))
     for j, w in enumerate(sim.weeks):
         fa = sim.index([e for e in fa_by_week.get(w, []) if e not in set(roster_ids)])
-        total += cal.weight(w) * _sim_lineup_points(sim, roster, fa, positions, slots, j)
-    return total
+        out[:, j] = _sim_lineup_points(sim, roster, fa, positions, slots, j)
+    return out
+
+
+def sim_roster_value(sim: Simulation, roster_ids, fa_by_week: dict, positions: dict, slots: dict, cal: LeagueCalendar) -> np.ndarray:
+    """Valor ponderado (playoffs ×peso) del roster en cada simulación (S,)."""
+    weights = np.array([cal.weight(w) for w in sim.weeks])
+    return sim_roster_weekly(sim, roster_ids, fa_by_week, positions, slots) @ weights
 
 
 def fa_candidates(fa_proj: pl.DataFrame, per_position: int = 3) -> dict:
@@ -847,6 +891,7 @@ def mc_evaluate_trade(sim: Simulation, league_proj: pl.DataFrame, fa_proj: pl.Da
     """Distribución del cambio de valor de cada equipo (mismos sorteos antes y después del trade).
 
     El jugador que se suelta si sobra roster es el mismo que en la evaluación determinista.
+    Con return_draws=True devuelve también, por equipo, los sorteos del cambio total (S,) y semanal (S, W).
     """
     positions = dict(zip(*pl.concat([league_proj, fa_proj], how="diagonal_relaxed")
                            .unique("espn_id").select("espn_id", "position").to_dict(as_series=False).values()))
@@ -856,13 +901,25 @@ def mc_evaluate_trade(sim: Simulation, league_proj: pl.DataFrame, fa_proj: pl.Da
     for me, other, gives, gets in ((team_a, team_b, a_gives, b_gives), (team_b, team_a, b_gives, a_gives)):
         before, after, dropped, invalid = rosters_after_trade(league_proj, me, other, gives, gets, rules, cal, cfg,
                                                               "exp_points", fa_proj)
-        v0 = sim_roster_value(sim, before["espn_id"].unique().to_list(), fa_by_week, positions, rules["slots"], cal)
-        v1 = sim_roster_value(sim, after["espn_id"].unique().to_list(), fa_by_week, positions, rules["slots"], cal)
+        w0 = sim_roster_weekly(sim, before["espn_id"].unique().to_list(), fa_by_week, positions, rules["slots"])
+        w1 = sim_roster_weekly(sim, after["espn_id"].unique().to_list(), fa_by_week, positions, rules["slots"])
+        weights = np.array([cal.weight(w) for w in sim.weeks])
+        v0, v1 = w0 @ weights, w1 @ weights
         d = v1 - v0
-        draws[me] = d
+        draws[me] = {"total": d, "weekly": w1 - w0}
         rows.append({"fantasy_team_id": me, "fantasy_team": before["fantasy_team"][0].strip(),
                      **{k: round(v, 3 if k == "prob_gana" else 1) for k, v in summarize(d).items()},
                      "valor_antes_p10": round(float(np.percentile(v0, 10)), 0), "valor_antes_p90": round(float(np.percentile(v0, 90)), 0),
                      "valido": invalid is None})
     out = pl.DataFrame(rows)
     return (out, draws) if return_draws else out
+
+
+def mc_weekly_summary(draws_weekly: np.ndarray, sim: Simulation, cal: LeagueCalendar) -> pl.DataFrame:
+    """Cambio semanal de puntos de la alineación (después − antes): media, intervalo 80% y P(>0)."""
+    return pl.DataFrame({
+        "week": pl.Series(sim.weeks, dtype=pl.Int32),
+        "fase": ["playoffs" if w in cal.playoff_weeks else "regular" for w in sim.weeks],
+        "media": draws_weekly.mean(axis=0).round(1), "p10": np.percentile(draws_weekly, 10, axis=0).round(1),
+        "p90": np.percentile(draws_weekly, 90, axis=0).round(1), "prob_mejora": (draws_weekly > 0).mean(axis=0).round(2),
+        "prob_empeora": (draws_weekly < 0).mean(axis=0).round(2)})
