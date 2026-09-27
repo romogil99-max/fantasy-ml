@@ -197,6 +197,7 @@ with tab_fa:
              .group_by("position", maintain_order=True).head(5))
     slots = res["slots"]
     top = top.with_columns(L.pickup_gain(roster.select("espn_id", "position", "available", "pred_model"), top, slots, "pred_model"))
+    top = top.join(MU.points_sd(top), on="espn_id", how="left")
     order = {s: i for i, s in enumerate(["QB", "RB", "WR", "TE", "K", "D/ST"])}
     top = top.with_columns(_o=pl.col("position").replace_strict(order, default=9)).sort("_o", pl.col("pred_model"), descending=[False, True])
     worth = top.filter(pl.col("mejora_alineacion") >= 3)
@@ -204,10 +205,11 @@ with tab_fa:
         st.success("**Vale la pena considerar:** " + ", ".join(f"{r['name']} ({r['position']}, +{r['mejora_alineacion']:.1f})"
                                                            for r in worth.to_dicts()))
     st.dataframe(top.select(pos="position", jugador="name", rival="opponent", lesion="injury", prediccion="pred_model",
-                            p10="pred_q10", p90="pred_q90", espn="espn_projection", mejora="mejora_alineacion"),
+                            p10="pred_q10", p90="pred_q90", desv="desv", espn="espn_projection", mejora="mejora_alineacion"),
                  hide_index=True, width="stretch",
                  column_config={c: st.column_config.NumberColumn(format="%.1f") for c in ("prediccion", "p10", "p90", "espn")}
-                 | {"mejora": st.column_config.NumberColumn("Mejora de la alineación", format="%+.1f")})
+                 | {"mejora": st.column_config.NumberColumn("Mejora de la alineación", format="%+.1f"),
+                    "desv": st.column_config.NumberColumn("Desv.", format="%.1f", help=SD_HELP)})
 
 # ---------------------------------------------------------------- próximas semanas
 

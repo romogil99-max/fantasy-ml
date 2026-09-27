@@ -257,6 +257,21 @@ def player_sd(players: pl.DataFrame, sims: dict) -> pl.DataFrame:
     return players.select("espn_id").with_columns(desv=pl.col("espn_id").replace_strict(sd, default=None, return_dtype=pl.Float64))
 
 
+def points_sd(df: pl.DataFrame, n_sims: int = 10000, seed: int = 0) -> pl.DataFrame:
+    """Desviación de puntos de cualquier grupo de jugadores (p. ej. agentes libres), con el mismo método
+    que el enfrentamiento: P(jugar) por su estado de ESPN, puntos escalados a su rango P10–P90, 0 si no juega.
+
+    `df` necesita espn_id, position, injury, pred_model, pred_q10 y pred_q90.
+    """
+    status_p = data.load_config("trades")["status_play_prob"]
+    players = df.select("espn_id", "position", "pred_model", "pred_q10", "pred_q90", "injury").with_columns(
+        finished=pl.lit(False), espn_points=pl.lit(0.0),
+        p_play=pl.when(pl.col("pred_model").is_null() | pl.col("injury").fill_null("").is_in(list(OUT_STATUSES))).then(0.0)
+                 .otherwise(pl.col("injury").replace_strict(status_p, default=1.0, return_dtype=pl.Float64)))
+    bt = pl.read_parquet(DATA_PROC / "backtest_predictions.parquet").filter(pl.col("season") == 2025)
+    return player_sd(players, simulate_players(players, residual_pools(bt), n_sims, seed))
+
+
 def range_consistency(players: pl.DataFrame, sims: dict) -> pl.DataFrame:
     """Compara, jugador por jugador, los percentiles 10/90 simulados (si juega) con su rango P10–P90."""
     rows = []
