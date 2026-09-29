@@ -7,24 +7,31 @@
 - Simulación: cada jugador juega según su estado de ESPN; si juega, sus puntos se muestrean de los
   residuos reales del backtest de 2025 (por posición y quintil de predicción), escalados para que su
   dispersión coincida con SU rango P10–P90 y centrados en su predicción. Si un titular no juega, entra
-  el mejor suplente disponible de su banca. Jugadores cuyo partido ya terminó: puntos reales de ESPN.
+  el mejor suplente disponible de su banca.
+- Partidos en vivo (hora de inicio del calendario de nflverse, porque ESPN reporta 0% jugado hasta el final):
+  sin empezar → se simula completo; en curso → puntos en vivo de ESPN + lo que falta (fracción de partido
+  pendiente según el reloj, ~3 h 15 min por partido, con incertidumbre proporcional); terminado (ESPN 100%
+  o 4.5 h desde el inicio) → puntos reales. Un jugador cuyo partido ya empezó está bloqueado: no se puede
+  sentar ni entrar desde la banca (como en ESPN).
 - Limitación: jugadores independientes entre sí (sin correlación QB–WR ni contra la D/ST rival).
 
 Ejecutable: `python -m fantasy_ml.matchup --log` agrega una fila a data/predictions_log/winprob_<temporada>.csv.
 """
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import polars as pl
 
-from . import data, espn, lineup as L, predictions_log as plog
+from . import data, espn, features as F, lineup as L, predictions_log as plog
 from .data import DATA_PROC, PREDICTIONS_LOG
 
 OUT_STATUSES = {"OUT", "INJURY_RESERVE", "IR", "SUSPENSION"}
 BENCH = {"BE", "IR"}
 N_BUCKETS = 5
 THRESHOLD = 3.0  # decisiones "cerradas": menos de 3 puntos esperados de diferencia
+GAME_HOURS = 3.25         # duración típica de un partido (para la fracción pendiente de uno en curso)
+FINAL_AFTER_HOURS = 4.5   # si ESPN aún no lo marca terminado, se da por terminado tras este tiempo
 
 
 # ---------------------------------------------------------------- datos del enfrentamiento
@@ -41,8 +48,13 @@ def espn_win_probability(league, week: int, me: int) -> float | None:
         return None
 
 
-def matchup_players(league, week: int, me: int, log: pl.DataFrame, cfg: dict) -> tuple[pl.DataFrame, dict]:
-    """Jugadores de los dos equipos con slot actual, estado, predicción del registro y puntos ya jugados."""
+def matchup_players(league, week: int, me: int, log: pl.DataFrame, cfg: dict, now: datetime | None = None) -> tuple[pl.DataFrame, dict]:
+    """Jugadores de los dos equipos con slot actual, estado, predicción del registro y situación de su partido.
+
+    Columnas del partido: kickoff (UTC), locked (ya empezó), finished, in_progress y frac_left (fracción
+    pendiente estimada de un partido en curso). `now` permite reproducir un momento pasado.
+    """
+    now = now or datetime.now(timezone.utc)
     box = next(b for b in league.box_scores(week)
                if me in (getattr(b.home_team, "team_id", None), getattr(b.away_team, "team_id", None)))
     home_is_me = box.home_team.team_id == me
@@ -53,18 +65,32 @@ def matchup_players(league, week: int, me: int, log: pl.DataFrame, cfg: dict) ->
             status = p.injuryStatus if isinstance(p.injuryStatus, str) else None
             rows.append({"team": "yo" if team.team_id == me else "rival", "espn_id": p.playerId, "name": p.name,
                          "position": p.position, "slot": p.slot_position, "injury": status,
+                         "nfl_team": F.ESPN_TO_NFLVERSE.get(p.proTeam, p.proTeam),
                          "game_played": p.game_played, "espn_points": float(p.points or 0.0),
                          "espn_projection": float(p.projected_points or 0.0), "on_bye": bool(p.on_bye_week)})
+    tg = F.team_games(data.load_sources()["schedules"])
+    kick = (tg.filter(pl.col("season") == league.year, pl.col("week") == week)
+              .select(nfl_team="team", kickoff=plog.kickoff_utc(tg)))
+    now_l = pl.lit(now).cast(pl.Datetime("us", "UTC"))
+    elapsed_h = (now_l - pl.col("kickoff")).dt.total_seconds() / 3600
     df = (pl.DataFrame(rows)
-            .join(log.select("espn_id", "pred_model", "pred_q10", "pred_q90", "kickoff_utc"), on="espn_id", how="left"))
+            .join(log.select("espn_id", "pred_model", "pred_q10", "pred_q90"), on="espn_id", how="left")
+            .join(kick, on="nfl_team", how="left")
+            .with_columns(locked=pl.col("kickoff").is_not_null() & (pl.col("kickoff") <= now_l))
+            .with_columns(finished=pl.col("locked") & ((pl.col("game_played") >= 100) | (elapsed_h >= FINAL_AFTER_HOURS)))
+            .with_columns(in_progress=pl.col("locked") & ~pl.col("finished"),
+                          frac_left=pl.when(pl.col("locked") & ~pl.col("finished"))
+                                      .then((1 - elapsed_h / GAME_HOURS).clip(0.05, 1.0)).otherwise(pl.lit(1.0))))
     status_p = cfg["status_play_prob"]
     df = df.with_columns(
-        finished=pl.col("game_played") >= 100,
         p_play=pl.when(pl.col("on_bye") | pl.col("pred_model").is_null()).then(0.0)
                  .when(pl.col("injury").is_in(list(OUT_STATUSES))).then(0.0)
+                 .when(pl.col("locked")).then(1.0)   # su partido ya empezó y no está OUT: está jugando
                  .otherwise(pl.col("injury").replace_strict(status_p, default=1.0, return_dtype=pl.Float64)))
     info = {"rival": rival.team_name.strip(), "espn_proj_me": box.away_projected if not home_is_me else box.home_projected,
-            "espn_proj_rival": box.home_projected if not home_is_me else box.away_projected}
+            "espn_proj_rival": box.home_projected if not home_is_me else box.away_projected,
+            "score_me": box.away_score if not home_is_me else box.home_score,
+            "score_rival": box.home_score if not home_is_me else box.away_score}
     return df, info
 
 
@@ -75,7 +101,7 @@ def fill_holes(team: pl.DataFrame, slots: dict) -> pl.DataFrame:
     bye, sin predicción). Devuelve el equipo con la columna `starter_slot` (None = banca).
     """
     starters = {r["espn_id"]: r["slot"] for r in team.filter(~pl.col("slot").is_in(list(BENCH))).to_dicts()}
-    ok = {e for e, p in zip(team["espn_id"], team["p_play"]) if p >= 0.5}
+    ok = {e for e, p, lk in zip(team["espn_id"], team["p_play"], team["locked"]) if p >= 0.5 or lk}  # bloqueado: se queda
     needed = L.starting_slots(slots)
     assigned, used = [], set()
     for slot in needed:  # titulares actuales disponibles, en su slot
@@ -83,7 +109,8 @@ def fill_holes(team: pl.DataFrame, slots: dict) -> pl.DataFrame:
         assigned.append(hit)
         if hit is not None:
             used.add(hit)
-    bench = team.filter(~pl.col("espn_id").is_in(list(used)), pl.col("p_play") >= 0.5, pl.col("pred_model").is_not_null()) \
+    bench = team.filter(~pl.col("espn_id").is_in(list(used)), pl.col("p_play") >= 0.5, pl.col("pred_model").is_not_null(),
+                        ~pl.col("locked")) \
                 .sort(pl.col("pred_model") * pl.col("p_play"), descending=True).to_dicts()
     for k, slot in enumerate(needed):
         if assigned[k] is None:
@@ -100,12 +127,18 @@ def current_lineup(team: pl.DataFrame) -> pl.DataFrame:
 
 
 def optimal_lineup(team: pl.DataFrame, slots: dict) -> pl.DataFrame:
-    """Alineación óptima por puntos esperados (predicción × probabilidad de jugar; ya jugados: puntos reales)."""
-    t = team.with_columns(exp=pl.when(pl.col("finished")).then(pl.col("espn_points"))
-                                 .otherwise(pl.col("pred_model").fill_null(0) * pl.col("p_play")),
-                          available=(pl.col("p_play") > 0) | pl.col("finished"))
-    opt = L.optimal_lineup(t, slots, "exp")
-    slot_of = dict(zip(opt["espn_id"].to_list(), opt["slot"].to_list()))
+    """Alineación óptima por puntos esperados, respetando los bloqueos: los titulares cuyo partido ya empezó
+    se quedan en su slot y los de la banca que ya empezaron no pueden entrar. El resto se optimiza por
+    predicción × probabilidad de jugar."""
+    fixed = team.filter(pl.col("locked"), ~pl.col("slot").is_in(list(BENCH)))
+    counts = dict(slots)
+    for sl in fixed["slot"].to_list():
+        counts[sl] = counts.get(sl, 0) - 1
+    free = team.filter(~pl.col("locked")).with_columns(exp=pl.col("pred_model").fill_null(0) * pl.col("p_play"),
+                                                       available=pl.col("p_play") > 0)
+    opt = L.optimal_lineup(free, counts, "exp")
+    slot_of = {**dict(zip(fixed["espn_id"].to_list(), fixed["slot"].to_list())),
+               **{e: s for e, s in zip(opt["espn_id"].to_list(), opt["slot"].to_list()) if e is not None}}
     return team.with_columns(starter_slot=pl.col("espn_id").replace_strict(slot_of, default=None, return_dtype=pl.Utf8))
 
 
@@ -132,20 +165,27 @@ def simulate_players(players: pl.DataFrame, pools: dict, n_sims: int = 10000, se
     rng = np.random.default_rng(seed)
     out = {}
     for r in players.to_dicts():
-        if r["finished"]:
+        if r.get("finished"):
             out[r["espn_id"]] = (np.full(n_sims, r["espn_points"]), np.ones(n_sims, bool))
             continue
         plays = rng.random(n_sims) < r["p_play"]
         pool = pools.get(r["position"])
         if r["pred_model"] is None or pool is None:
-            out[r["espn_id"]] = (np.zeros(n_sims), np.zeros(n_sims, bool))
+            live = r["espn_points"] if r.get("in_progress") else 0.0
+            out[r["espn_id"]] = (np.full(n_sims, live), np.full(n_sims, bool(r.get("in_progress"))))
             continue
         res = pool["resid"][int(np.searchsorted(pool["edges"], r["pred_model"]))]
         width_pool = max(np.percentile(res, 90) - np.percentile(res, 10), 1e-6)
         width = (r["pred_q90"] - r["pred_q10"]) if r["pred_q90"] is not None else width_pool
         e = rng.choice(res, size=n_sims)
         e = (e - res.mean()) * (width / width_pool)
-        out[r["espn_id"]] = (np.maximum(r["pred_model"] + e, pool["floor"]), plays)
+        if r.get("in_progress"):
+            # puntos en vivo + lo que falta: media f·pred, desviación √f·σ (incrementos independientes)
+            f = r["frac_left"]
+            rest = np.maximum(f * r["pred_model"] + np.sqrt(f) * e, f * pool["floor"])
+            out[r["espn_id"]] = (r["espn_points"] + rest, np.ones(n_sims, bool))
+        else:
+            out[r["espn_id"]] = (np.maximum(r["pred_model"] + e, pool["floor"]), plays)
     return out
 
 
@@ -156,14 +196,14 @@ def lineup_totals(team: pl.DataFrame, sims: dict, slots: dict, n_sims: int) -> n
     manager antes del partido; los partidos ya terminados no se pueden cambiar.
     """
     starters = team.filter(pl.col("starter_slot").is_not_null()).to_dicts()
-    bench = (team.filter(pl.col("starter_slot").is_null(), pl.col("slot") != "IR")
+    bench = (team.filter(pl.col("starter_slot").is_null(), pl.col("slot") != "IR", ~pl.col("locked"))
                  .sort(pl.col("pred_model").fill_null(-1), descending=True).to_dicts())
     total = np.zeros(n_sims)
     used = np.zeros((n_sims, len(bench)), bool)
     for s in starters:
         pts, plays = sims[s["espn_id"]]
         total += np.where(plays, pts, 0.0)
-        if s["finished"]:
+        if s["locked"]:   # su partido ya empezó: no se puede cambiar
             continue
         missing = ~plays
         allowed = L.FLEX_SLOTS.get(s["starter_slot"], {s["starter_slot"]})
@@ -203,8 +243,8 @@ def close_decisions(me_team: pl.DataFrame, rival_team: pl.DataFrame, sims: dict,
     base = win_probability(me_team, rival_team, sims, slots, n_sims)
     favorite = base["p_win"] >= 0.5
     rows = []
-    starters = me_team.filter(pl.col("starter_slot").is_not_null(), ~pl.col("finished")).to_dicts()
-    bench = me_team.filter(pl.col("starter_slot").is_null(), pl.col("slot") != "IR", ~pl.col("finished"),
+    starters = me_team.filter(pl.col("starter_slot").is_not_null(), ~pl.col("locked")).to_dicts()
+    bench = me_team.filter(pl.col("starter_slot").is_null(), pl.col("slot") != "IR", ~pl.col("locked"),
                            pl.col("pred_model").is_not_null(), pl.col("p_play") > 0).to_dicts()
     sd = lambda e: float(np.std(np.where(sims[e][1], sims[e][0], 0.0)))
     exp = lambda r: r["pred_model"] * r["p_play"]
@@ -285,16 +325,17 @@ def range_consistency(players: pl.DataFrame, sims: dict) -> pl.DataFrame:
 
 # ---------------------------------------------------------------- flujo completo
 
-def analyze(season: int = 2026, n_sims: int = 10000, seed: int = 0) -> dict:
-    """Todo el análisis del enfrentamiento de la semana actual."""
+def analyze(season: int = 2026, n_sims: int = 10000, seed: int = 0, week: int | None = None,
+            now: datetime | None = None) -> dict:
+    """Todo el análisis del enfrentamiento de la semana actual (o `week`), en el momento `now` (por defecto, ahora)."""
     cfg = data.load_config("trades")
     league = espn.connect(season)
-    me, week = espn.my_team_id(), league.current_week
+    me, week = espn.my_team_id(), week or league.current_week
     slots = {k: v for k, v in league.settings.position_slot_counts.items() if v}
     log = plog.latest_pregame(plog.read(season)).filter(pl.col("week") == week)
     if log.is_empty():
         raise RuntimeError(f"No hay predicciones registradas para la semana {week}: ejecuta el notebook 04")
-    players, info = matchup_players(league, week, me, log, cfg)
+    players, info = matchup_players(league, week, me, log, cfg, now)
     bt = pl.read_parquet(DATA_PROC / "backtest_predictions.parquet").filter(pl.col("season") == 2025)
     sims = simulate_players(players, residual_pools(bt), n_sims, seed)
     mine, rival = players.filter(pl.col("team") == "yo"), players.filter(pl.col("team") == "rival")

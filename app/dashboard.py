@@ -29,9 +29,17 @@ st.set_page_config(page_title="fantasy-ml", page_icon="🏈", layout="wide")
 
 # ---------------------------------------------------------------- datos (con caché)
 
-@st.cache_resource(ttl=600, show_spinner="Consultando ESPN y simulando el enfrentamiento…")
+@st.cache_resource(ttl=180, show_spinner="Consultando ESPN y simulando el enfrentamiento…")
 def load_matchup():
-    return MU.analyze(season=SEASON, n_sims=10000)
+    """Semana actual de ESPN; si aún no tiene predicciones registradas (se generan el miércoles a las 22:00),
+    la última semana registrada."""
+    try:
+        return MU.analyze(season=SEASON, n_sims=10000), None
+    except RuntimeError:
+        logged = plog.read(SEASON)["week"].unique().sort().to_list()
+        if not logged:
+            raise
+        return MU.analyze(season=SEASON, n_sims=10000, week=logged[-1]), logged[-1]
 
 
 @st.cache_resource(ttl=600, show_spinner="Buscando agentes libres…")
@@ -70,19 +78,27 @@ with st.sidebar:
     if st.button("🔄 Actualizar datos de ESPN", width="stretch"):
         st.cache_resource.clear()
         st.rerun()
-    st.caption(f"Actualizado: {datetime.now(GDL):%d-%m %H:%M} (Guadalajara)\n\nLos datos se refrescan solos cada 10 min.")
+    st.caption(f"Actualizado: {datetime.now(GDL):%d-%m %H:%M} (Guadalajara)\n\nEl enfrentamiento se refresca solo cada 3 min; lo demás, cada 10.")
     st.caption(f"Versión del código: `{plog.code_version()}`")
 
 try:
-    res = load_matchup()
-except RuntimeError as e:  # sin predicciones registradas para la semana
+    res, fallback_week = load_matchup()
+except RuntimeError as e:  # sin ninguna predicción registrada en la temporada
     st.error(str(e))
     st.stop()
+if fallback_week is not None:
+    st.info(f"Todavía no hay predicciones de la semana nueva (se registran el miércoles a las 22:00). "
+            f"Se muestra la semana {fallback_week}, la última registrada.")
 
 week, rival = res["week"], res["info"]["rival"]
 a, o = res["actual"], res["optimal"]
 players = res["players"]
-SD = MU.player_sd(players, res["sims"])  # desviación de puntos por jugador (Monte Carlo, contando 0 si no juega)
+SD = MU.player_sd(players, res["sims"])
+STATUS = players.select("espn_id", estado=pl.when(pl.col("on_bye")).then(pl.lit("bye"))
+                        .when(pl.col("finished")).then(pl.lit("terminado"))
+                        .when(pl.col("in_progress")).then(pl.lit("en curso")).otherwise(pl.lit("sin empezar")),
+                        en_vivo=pl.when(pl.col("locked")).then(pl.col("espn_points")))
+STARTED = bool(players["locked"].any())  # desviación de puntos por jugador (Monte Carlo, contando 0 si no juega)
 SD_HELP = ("Desviación estándar de sus puntos esta semana en el Monte Carlo, contando 0 si no juega. "
            "Más alta = más incertidumbre (más techo y más riesgo). Si eres favorito conviene menos; si no, más.")
 
@@ -93,6 +109,12 @@ tab_week, tab_lineup, tab_fa, tab_next, tab_trades, tab_model = st.tabs(
 
 with tab_week:
     st.header(f"Semana {week} vs {rival}")
+    if STARTED:
+        live = players.filter(pl.col("locked"))
+        st.metric("Marcador en vivo", f"{res['info']['score_me']:.1f} vs {res['info']['score_rival']:.1f}",
+                  delta=f"{res['info']['score_me'] - res['info']['score_rival']:+.1f}")
+        st.caption("Con partidos en curso, la probabilidad usa los puntos en vivo de ESPN más lo que falta de cada partido "
+                   "(fracción pendiente según la hora de inicio, ~3 h 15 min por partido). Los terminados cuentan con sus puntos reales.")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("P(ganar) · mi alineación", pct(a["p_win"]))
     c2.metric("P(ganar) · alineación óptima", pct(o["p_win"]),
@@ -136,12 +158,14 @@ with tab_week:
     st.subheader(f"Alineación de {rival}")
     st.caption("Su alineación actual en ESPN; los huecos (vacío, OUT, IR, doubtful, bye) se cubren con su mejor suplente.")
     st.dataframe(res["rival"].filter(pl.col("starter_slot").is_not_null()).join(SD, on="espn_id", how="left")
-                 .select(slot="starter_slot", jugador="name", pos="position", lesion="injury",
+                 .join(STATUS, on="espn_id", how="left")
+                 .select(slot="starter_slot", jugador="name", pos="position", lesion="injury", partido="estado", en_vivo="en_vivo",
                          prediccion="pred_model", p10="pred_q10", p90="pred_q90", desv="desv", p_jugar="p_play", espn="espn_projection"),
                  hide_index=True, width="stretch",
                  column_config={c: st.column_config.NumberColumn(format="%.1f") for c in ("prediccion", "p10", "p90", "espn")}
                  | {"p_jugar": st.column_config.NumberColumn("P(jugar)", format="percent"),
-                    "desv": st.column_config.NumberColumn("Desv.", format="%.1f", help=SD_HELP)})
+                    "desv": st.column_config.NumberColumn("Desv.", format="%.1f", help=SD_HELP),
+                    "en_vivo": st.column_config.NumberColumn("Pts en vivo", format="%.1f")})
 
 # ---------------------------------------------------------------- mi alineación
 
@@ -149,16 +173,19 @@ with tab_lineup:
     st.header("Mi alineación")
     mine = res["mine_current"].join(res["mine_optimal"].select("espn_id", optima="starter_slot"), on="espn_id")
     order = {s: i for i, s in enumerate(["QB", "RB", "WR", "TE", "RB/WR/TE", "OP", "K", "D/ST", "BE", "IR"])}
-    table = (mine.join(SD, on="espn_id", how="left").with_columns(_o=pl.col("slot").replace_strict(order, default=99))
+    table = (mine.join(SD, on="espn_id", how="left").join(STATUS, on="espn_id", how="left")
+                 .with_columns(_o=pl.col("slot").replace_strict(order, default=99))
                  .sort("_o", pl.col("pred_model"), descending=[False, True], nulls_last=True)
-                 .select(slot="slot", jugador="name", pos="position", lesion="injury", prediccion="pred_model",
+                 .select(slot="slot", jugador="name", pos="position", lesion="injury", partido="estado", en_vivo="en_vivo",
+                         prediccion="pred_model",
                          p10="pred_q10", p90="pred_q90", desv="desv", espn="espn_projection", p_jugar="p_play",
                          en_la_optima=pl.col("optima").is_not_null()))
     st.dataframe(table, hide_index=True, width="stretch",
                  column_config={c: st.column_config.NumberColumn(format="%.1f") for c in ("prediccion", "p10", "p90", "espn")}
                  | {"p_jugar": st.column_config.NumberColumn("P(jugar)", format="percent"),
                     "desv": st.column_config.NumberColumn("Desv.", format="%.1f", help=SD_HELP),
-                    "en_la_optima": st.column_config.CheckboxColumn("¿Titular en la óptima?"),
+                    "en_vivo": st.column_config.NumberColumn("Pts en vivo", format="%.1f"),
+                    "en_la_optima": st.column_config.CheckboxColumn("¿Titular en la óptima?", help="Los jugadores cuyo partido ya empezó no se pueden mover"),
                     "p10": st.column_config.NumberColumn("P10", format="%.1f", help="8 de cada 10 veces sus puntos caen entre P10 y P90"),
                     "p90": st.column_config.NumberColumn("P90", format="%.1f")})
 
