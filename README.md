@@ -122,8 +122,13 @@ The log is append-only and only records games that haven't started. It can be re
 - **Simulation (10,000 runs):**
   - each player plays according to his ESPN status;
   - points are drawn from real out-of-sample residuals, scaled so each player's simulated P10–P90 matches his own range and centred on his prediction;
-  - a starter who sits is replaced from the bench;
-  - games already finished use actual points.
+  - a starter who sits is replaced from the bench.
+- **Live games:** ESPN reports 0% played until a game ends, so each game's status comes from its nflverse kickoff time:
+  - not started: simulated in full;
+  - in progress: live ESPN points plus the remaining fraction of the game (from the clock, ~3 h 15 min per game), with proportionally smaller uncertainty;
+  - finished (ESPN 100% or 4.5 h after kickoff): actual points.
+
+  Players whose game has started are locked, as in ESPN. Replaying week 3 reproduced the known values: 61.8% before kickoff, 67.6% with only the Monday game left (67.8% computed by hand) and 100% at the end.
 - **Multi-week outlook** (`outlook.py`): for the next 4 weeks it shows expected points with 80% ranges, win probability against each scheduled opponent, the bye calendar with real holes (slots my roster cannot fill), and free agents ranked by their gain over the horizon, including who to drop. Here free agents only fill holes, because it describes my own roster; in trade valuation they compete for every slot.
 - **Close decisions:** for start/sit choices within 3 expected points, it shows the lower-variance option (right when favoured), the higher-variance option (right when not favoured) and the option with the higher win probability this week.
 - **Sunday run:** the automated run appends the result to `winprob_<season>.csv`, alongside ESPN's own win probability.
